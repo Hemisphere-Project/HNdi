@@ -29,7 +29,25 @@ three repos and the hub on 2026-09-04; the decisions below supersede it.
   verified on the box (source resolve/connect/run, black-on-loss + auto-recover, `PUT/DELETE
   /source`). Left to close the phase: tag a release so CI publishes the plugin asset, then a
   field pass. The gst NDI plugin currently builds on the box with cargo (~1m30s).
-- **Phases 2–6** — not started (HKiosk `--capture`, then Dropfile model + player).
+- **Phase 2 — HKiosk `--capture`: DONE** (committed in HKiosk, not yet pushed). A
+  `-C/--capture` launcher flag + `kiosk.url` option appends
+  `--auto-accept-camera-and-microphone-capture` (and, for an http:// non-localhost
+  origin, `--unsafely-treat-insecure-origin-as-secure`).
+- **Phase 3 — Dropfile model/API/admin: DONE** (committed in Dropfile, not yet pushed).
+  `scene.ndi {on}` + `station.ndi {source}`, `mediaFilter.ndi`, `activeInfo.ndi`, admin
+  chips + NDI source field, `● NDI` status. Verified end to end against a booted server;
+  the drop page never carries `ndi`.
+- **Phase 4 — Dropfile player: DONE** (committed in Dropfile). `www/ndi.js` (`NdiInput`,
+  same surface as `StreamReceiver`) reads liveness from the bridge API; `player.js` merges
+  NDI + camera streams (newest wins) and reports `mode:'ndi'`.
+- **Phases 5–6** — not started (control-room source datalist is wired in the admin but its
+  feed — `player-status.ndi.sources` relayed from boxes — is Phase 5; WiFi auto-bandwidth +
+  audio are Phase 6).
+
+**Blocker for the release asset:** GitHub Actions is **disabled at the Hemisphere-Project
+org level**, so the `gst-ndi` workflow cannot run. Until an org admin enables Actions (org
+settings → Actions, or per-repo), `install.sh` builds the plugin on the box with cargo
+(~1m30s) — which works. The workflow file is correct and waiting.
 
 Remaining Phase 0 field items (need Resolume/OBS on the KXKM LAN + the display): end-to-end
 **latency** by the photo method, and the **WiFi-bridge** degradation behaviour.
