@@ -13,10 +13,12 @@ network leg is loopback here; the WiFi / Resolume legs are still to measure on s
 | NDI names | full form `MACHINE (name)`, machine upper-cased: `HMINI-001 (HNDI-TEST)`; discovery via Gst.DeviceMonitor works (properties `ndi-name`, `url-address`); `url-address=ip:port` connects without discovery |
 | Chrome accepts | **YUY2 yes** (label `NDI`, 1920×1080@60). **UYVY no** — a UYVY-only loopback is invisible to `enumerateDevices`. I420 not tested (GStreamer side errored, not investigated) |
 | Permission | `--auto-accept-camera-and-microphone-capture` → `getUserMedia` OK next to `--deny-permission-prompts`; without it → `NotAllowedError`. Policy file not needed |
-| fps in page @1080p60 | **60–61 fps, 0 stalls** (rVFC counter, `bench/ndi-test.html`) |
+| device write rate | **60 fps exact** at the v4l2 device (GStreamer fpsdisplaysink around v4l2sink) |
+| fps in page @1080p60 | **60 fps** with the bench page fullscreen on the 60 Hz HDMI panel (screenshot). Read over CDP on a non-vsync'd page the rVFC counter free-runs to 300+ — a measurement artifact; the real Dropfile player is vsync-capped, confirm there. Output pipeline uses `v4l2sink sync=true` so the device itself is paced at 60 |
 | CPU (one core = 100 %) | receiver `gst-launch` ~90 % · Chrome ~60 % total (gpu 6 + renderer 4 + capture 2 in `ps`, ~60 in `top`) · sender ~85 % (not present in production). Box total incl. sender ≈ 66 % |
 | Latency wired / WiFi | **not yet** — photo method with Resolume on site |
-| Sender kill → black → resume | with the bench's single gst-launch: pipeline exits (expected). Real test = `hndi-in` (Phase 1) |
+| Sender kill → black → resume | **`hndi-in` verified**: kill sender → `running → retrying → resolving`, device keeps emitting the last frame then black (getUserMedia never ends); sender back → `running`, `restarts` increments; `PUT /source` (name or `ndi://ip:port`) switches in ~3 s; `DELETE /source` reverts to `hndi.conf`; all with the browser device held open |
+| intervideosrc → v4l2sink | needs a `capssetter join=true` adding interlace-mode=progressive, pixel-aspect-ratio=1/1, multiview-mode=mono and the device's own colorimetry (v4l2loopback advertises one; the daemon probes it) — else `not-negotiated` |
 
 Run: `sudo bench/phase0.sh` (deps → runtime → plugin → loopback → sender → receiver), then
 `sudo bench/phase0.sh chrome`; `bench/cdp.py --title` reads the page HUD; `bench/phase0.sh restore`
