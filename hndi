@@ -32,11 +32,17 @@ def cmd_status(args):
     s = api('GET', '/status')
     if '--json' in args:
         print(json.dumps(s, indent=1)); return
+    C = {'running': '32', 'stalled': '33', 'connecting': '36', 'retrying': '31', 'resolving': '31', 'stopped': '90'}
+    disp = 'stalled' if (s.get('stalled') and s['state'] == 'running') else s['state']
+    col = ('\033[1;%sm%s\033[0m' % (C.get(disp, '0'), disp.upper())) if sys.stdout.isatty() else disp.upper()
     src = s['source']
-    print(f"hndi-in {s['version']}  state: {s['state']}   uptime {s['uptime_s']}s   restarts {s['restarts']}")
+    thr = s.get('thresholds', {})
+    print(f"hndi-in {s['version']}  state: {col}   uptime {s['uptime_s']}s   restarts {s['restarts']}")
     print(f"source : {src['resolved'] or '-'}   (configured: {src['configured'] or 'first found'}{'; override: ' + src['override'] if src['override'] else ''})")
     print(f"device : {s['device']}  {s['format']} {s['width']}x{s['height']}  fps {s['fps'] or 'passthrough'}  measured {s['fps_measured']}")
     print(f"link   : bandwidth {s['bandwidth']}   frames {s['frames']}   last frame {s['last_frame_age_ms'] if s['last_frame_age_ms'] is not None else '-'} ms ago")
+    if thr:
+        print(f"recover: stall {thr.get('stall_ms')} · dead {thr.get('dead_ms')} · hold {thr.get('hold_ms')} ms   nosignal {s.get('nosignal','black')}")
     print(f"as     : {s['receiver']}   config {s['config'] or '(defaults)'}")
 
 
