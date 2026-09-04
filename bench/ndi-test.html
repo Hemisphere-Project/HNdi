@@ -16,7 +16,7 @@
 const LABEL = /NDI/i, WANT = 60;
 const hud = document.getElementById('hud'), cv = document.getElementById('c'), cx = cv.getContext('2d', {alpha:false});
 const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = true; document.body.appendChild(v);
-let frames = 0, fps = 0, fpsN = 0, stalls = 0, t0 = 0, tSec = performance.now(), tLast = performance.now(), label = '?', err = '';
+let devList = '', frames = 0, fps = 0, fpsN = 0, stalls = 0, t0 = 0, tSec = performance.now(), tLast = performance.now(), label = '?', err = '';
 function say(s, cls){ hud.innerHTML = s; hud.className = cls || ''; }
 async function pick(){
   let devs = await navigator.mediaDevices.enumerateDevices();
@@ -25,12 +25,13 @@ async function pick(){
     devs = await navigator.mediaDevices.enumerateDevices();
   }
   const cams = devs.filter(d => d.kind === 'videoinput');
+  devList = devs.map(d => d.kind.replace('input', '') + ':' + (d.label || '?')).join(',') || 'none';
   return cams.find(d => LABEL.test(d.label)) || cams[0];
 }
 async function start(){
   try {
     const dev = await pick();
-    if (!dev) { err = 'no videoinput device'; render(); return setTimeout(start, 2000); }
+    if (!dev) { err = 'no videoinput device (devices=' + devList + ')'; render(); return setTimeout(start, 2000); }
     const s = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ deviceId:{exact:dev.deviceId}, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:WANT} } });
     label = dev.label; err = ''; v.srcObject = s; await v.play().catch(() => {}); t0 = performance.now();
     s.getVideoTracks()[0].onended = () => { err = 'track ended'; render(); setTimeout(start, 2000); };

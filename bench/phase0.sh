@@ -150,6 +150,6 @@ run(){ testsrc && discover && receive && status; }
 all(){ deps && ndi && plugin && loopback && run; }
 
 case "${1:-all}" in
-  all|deps|ndi|plugin|loopback|testsrc|discover|receive|run|chrome|hud|shot|cpu|status|stop|restore) "$1" ;;
+  all|deps|ndi|plugin|loopback|testsrc|discover|receive|run|chrome|hud|shot|cpu|status|stop|restore) "$1" "${@:2}" ;;
   *) echo "usage: $0 [all|deps|ndi|plugin|loopback|testsrc|discover|receive|run|chrome|hud|shot|cpu|status|stop|restore]"; exit 1 ;;
 esac
