@@ -417,9 +417,13 @@ class Node:
                 if stalled and not self.stalled:
                     log.info('stalled (no frame %d ms) — holding, receiver kept', int(age))
                 self.stalled = stalled
-        elif self.state == 'connecting' and self.last_frame_t is None and self.in_pipe and (now - self._state_t) > 15:
-            log.warning('no first frame after 15 s — restarting input')
-            self._schedule_retry()
+        elif self.state == 'connecting' and self.last_frame_t is None and self.in_pipe:
+            waited = now - self._state_t
+            if waited > 15:
+                log.warning('no first frame after 15 s — restarting input')
+                self._schedule_retry()
+            elif waited * 1000 > self.conf['hold_ms']:
+                self._start_slate()      # connecting but no frames yet → show the slate, not black
         self._push_sse(heartbeat=True)
         return True
 
