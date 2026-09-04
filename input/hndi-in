@@ -59,7 +59,7 @@ async function tick(){try{
  const rows=[['source (config)',s.source.configured||'first found'],['override',s.source.override||'—'],
   ['device',s.device+'  '+s.format+'  '+s.width+'×'+s.height],['fps',s.fps_measured+(s.fps?(' / '+s.fps):'')],
   ['frames',s.frames],['restarts',s.restarts],['last frame',(s.last_frame_age_ms==null?'—':s.last_frame_age_ms+' ms ago')],
-  ['bandwidth',s.bandwidth],['thresholds','stall '+s.thresholds.stall_ms+' · dead '+s.thresholds.dead_ms+' · hold '+s.thresholds.hold_ms+' ms'],
+  ['bandwidth',s.bandwidth+(s.auto?' · auto':'')+' · '+s.profile],['thresholds','stall '+s.thresholds.stall_ms+' · dead '+s.thresholds.dead_ms+' · hold '+s.thresholds.hold_ms+' ms'],
   ['uptime',s.uptime_s+' s'],['version',s.version]];
  $('grid').innerHTML=rows.map(r=>'<div class=k>'+r[0]+'</div><div class="v'+(r[0]==='restarts'&&s.restarts>0?' warn':'')+'">'+r[1]+'</div>').join('');
 }catch(e){$('state').textContent='(bridge unreachable)';$('state').className='state stopped';}}
@@ -81,6 +81,7 @@ DEFAULTS = {
         'source': '', 'width': '1920', 'height': '1080', 'fps': '', 'format': 'UYVY',
         'device': '10', 'bandwidth': 'highest', 'receiver_name': '',
         'hold_ms': '', 'stall_ms': '800', 'dead_ms': '8000', 'timeout': '2000',  # timeout = legacy alias for hold_ms
+        'profile': 'lowlatency', 'jitter_ms': '',   # lowlatency (Ethernet) | robust (WiFi jitter buffer)
         'nosignal': 'black', 'api_port': '8791',
     },
     'discovery': {'server': ''},
@@ -110,6 +111,7 @@ def load_config(path=None):
         'hold_ms': int(c.get('hold_ms') or c.get('timeout') or 1500),   # hold last frame this long, then black
         'stall_ms': int(c.get('stall_ms') or 800),                       # no frame this long → 'stalled' (ride it out)
         'dead_ms': int(c.get('dead_ms') or 8000),                        # no frame this long → reconnect
+        'profile': (c.get('profile') or 'lowlatency').strip().lower(),
         'receiver_name': c.get('receiver_name').strip() or f'{socket.gethostname()} (HNdi)',
         'nosignal': c.get('nosignal').strip() or 'black',
         'api_port': int(c.get('api_port') or 8791),
@@ -117,6 +119,11 @@ def load_config(path=None):
     }
     if conf['bandwidth'] not in ('highest', 'lowest', 'auto'):
         conf['bandwidth'] = 'highest'
+    if conf['profile'] not in ('lowlatency', 'robust'):
+        conf['profile'] = 'lowlatency'
+    jit = c.get('jitter_ms')
+    conf['jitter_ms'] = int(jit) if jit else (100 if conf['profile'] == 'robust' else 0)  # receive jitter buffer
+    conf['ndi_queue'] = 8 if conf['profile'] == 'robust' else 2                            # ndisrc internal queue
     return conf
 
 
@@ -155,7 +162,10 @@ class Node:
         self.loop = GLib.MainLoop()
         self.state = 'stopped'
         self.override = self._load_override()
-        self.bandwidth = conf['bandwidth']
+        self.mode = conf['bandwidth']                       # configured: highest | lowest | auto
+        self.auto = (self.mode == 'auto')
+        self.bandwidth = 'highest' if self.auto else self.mode   # effective NDI bandwidth
+        self._bad = 0; self._good = 0; self._fps_baseline = 0.0; self._last_bw_switch = 0.0
         self.resolved = None          # {'name', 'url'} of the source we are connected to
         self.frames = 0
         self.fps_measured = 0.0
@@ -237,9 +247,15 @@ class Node:
         else:
             sel = f'ndi-name="{src["name"]}"'
         rate = f'! videorate ! video/x-raw,framerate={c["fps"]}/1 ' if c['fps'] else ''
+        j = c['jitter_ms']
+        if j > 0:   # robust: a receive-side jitter buffer absorbs WiFi jitter (~j ms extra latency)
+            vq = (f'queue max-size-time={3 * j * 1000000} min-threshold-time={j * 1000000} '
+                  f'max-size-buffers=0 max-size-bytes=0 leaky=downstream')
+        else:       # lowlatency: hold nothing back
+            vq = 'queue max-size-buffers=1 leaky=downstream'
         return (f'ndisrc {sel} receiver-ndi-name="{c["receiver_name"]}" bandwidth={bw} '
-                f'timeout={c["dead_ms"] + 5000} connect-timeout=10000 max-queue-length=2 color-format=uyvy-bgra '
-                f'! ndisrcdemux name=d d.video ! queue max-size-buffers=1 leaky=downstream '
+                f'timeout={c["dead_ms"] + 5000} connect-timeout=10000 max-queue-length={c["ndi_queue"]} color-format=uyvy-bgra '
+                f'! ndisrcdemux name=d d.video ! {vq} '
                 f'! videoconvert n-threads=4 ! videoscale '
                 f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]} '
                 f'{rate}! {self.caps_shim()} '      # same tags as the output side → intervideosrc passes frames through untouched
@@ -424,8 +440,34 @@ class Node:
                 self._schedule_retry()
             elif waited * 1000 > self.conf['hold_ms']:
                 self._start_slate()      # connecting but no frames yet → show the slate, not black
+        if self.auto:
+            self._auto_bandwidth()
         self._push_sse(heartbeat=True)
         return True
+
+    # bandwidth=auto: while connected, learn the healthy fps, score degradation, and drop
+    # to the NDI proxy stream ('lowest') under sustained trouble — recover to 'highest' when
+    # clean again. Each switch is a deliberate input restart, rate-limited to avoid flapping.
+    def _auto_bandwidth(self):
+        if self.state != 'running':
+            return                                   # a full dropout is the reconnect path's job, not bandwidth's
+        if not self.stalled and self.fps_measured > 0:
+            self._fps_baseline = max(self._fps_baseline, self.fps_measured)
+        bad = self.stalled or (self._fps_baseline and self.fps_measured < self._fps_baseline * 0.5)
+        if bad:
+            self._bad = min(12, self._bad + 1); self._good = 0
+        else:
+            self._bad = max(0, self._bad - 1); self._good += 1
+        now = time.monotonic()
+        dwell = now - self._last_bw_switch
+        if self.bandwidth == 'highest' and self._bad >= 5 and dwell > 30 and self.resolved:
+            log.warning('link degraded (score %d) → bandwidth lowest (proxy)', self._bad)
+            self.bandwidth = 'lowest'; self._last_bw_switch = now; self._bad = 0; self._good = 0
+            self.restarts += 1; self._start_input(self.resolved)
+        elif self.bandwidth == 'lowest' and self._good >= 30 and dwell > 45 and self.resolved:
+            log.info('link recovered (%ds clean) → bandwidth highest', self._good)
+            self.bandwidth = 'highest'; self._last_bw_switch = now; self._good = 0
+            self.restarts += 1; self._start_input(self.resolved)
 
     # state / status ----------------------------------------------------
     def _set_state(self, s):
@@ -453,6 +495,7 @@ class Node:
             'receiver': c['receiver_name'], 'width': c['width'], 'height': c['height'],
             'fps': c['fps'] or None, 'fps_measured': self.fps_measured, 'format': c['format'],
             'device': f'/dev/video{c["device"]}', 'bandwidth': self.bandwidth,
+            'mode': self.mode, 'auto': self.auto, 'profile': c['profile'],
             'frames': self.frames, 'restarts': self.restarts, 'stalled': self.stalled,
             'nosignal': c['nosignal'],
             'thresholds': {'stall_ms': c['stall_ms'], 'dead_ms': c['dead_ms'], 'hold_ms': c['hold_ms']},
@@ -480,11 +523,15 @@ class Node:
         mode = (mode or '').lower()
         if mode not in ('highest', 'lowest', 'auto'):
             return False
-        if mode == 'auto':
-            log.info('bandwidth auto: not implemented yet (phase 6) — behaving as highest')
-        self.bandwidth = mode
-        if self.resolved:
-            self._start_input(self.resolved)
+        self.mode = mode
+        self.auto = (mode == 'auto')
+        self._bad = self._good = 0; self._last_bw_switch = time.monotonic()
+        eff = 'highest' if self.auto else mode        # auto starts at highest, then adapts
+        if eff != self.bandwidth:
+            self.bandwidth = eff
+            if self.resolved:
+                self.restarts += 1
+                self._start_input(self.resolved)
         return False
 
     # SSE ---------------------------------------------------------------
