@@ -18,6 +18,7 @@ Python 3 stdlib + PyGObject only. Runs as root under systemd (hndi-in.service).
 """
 import argparse
 import configparser
+import re
 import json
 import logging
 import os
@@ -37,6 +38,9 @@ VERSION = '0.1.0'
 CONF_PATHS = ['/boot/firmware/hndi.conf', '/boot/hndi.conf']
 STATE_DIRS = ['/data/var/hndi', '/var/tmp/hndi']
 CHANNEL = 'hndi'
+# v4l2sink requires these fields fixed in the caps it is offered; intervideosrc fixates
+# without them (subset check fails → not-negotiated). capssetter adds them, zero-copy.
+SHIM = 'interlace-mode=progressive,pixel-aspect-ratio=1/1,multiview-mode=mono'
 RESOLVE_INTERVAL_S = 3
 log = logging.getLogger('hndi-in')
 
@@ -154,11 +158,39 @@ class Node:
         return self.override or self.conf['source']
 
     # pipelines ---------------------------------------------------------
+    def probe_colorimetry(self):
+        """The loopback device advertises one colorimetry per format (v4l2loopback: sRGB);
+        offering anything else is refused, so read it from v4l2sink's probed caps."""
+        if getattr(self, '_colorimetry', None):
+            return self._colorimetry
+        col = 'sRGB'
+        try:
+            s = Gst.ElementFactory.make('v4l2sink')
+            s.set_property('device', f'/dev/video{self.conf["device"]}')
+            if s.set_state(Gst.State.READY) != Gst.StateChangeReturn.FAILURE:
+                caps = s.get_static_pad('sink').query_caps(None)
+                for i in range(caps.get_size()):
+                    st = caps.get_structure(i)
+                    if st.get_string('format') == self.conf['format']:
+                        m = re.search(r'colorimetry=\(string\)\{?\s*([^,}\s;]+)', st.to_string())
+                        if m:
+                            col = m.group(1)
+                            break
+            s.set_state(Gst.State.NULL)
+        except Exception as e:  # noqa: BLE001
+            log.warning('colorimetry probe failed: %s', e)
+        self._colorimetry = col
+        return col
+
+    def caps_shim(self):
+        return f'capssetter join=true caps=video/x-raw,{SHIM},colorimetry={self.probe_colorimetry()}'
+
     def out_desc(self):
         c = self.conf
         fps = c['fps'] or 60
         return (f'intervideosrc channel={CHANNEL} timeout={c["timeout_ms"] * 1000000} '
                 f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]},framerate={fps}/1 '
+                f'! {self.caps_shim()} '
                 f'! queue max-size-buffers=2 leaky=downstream '
                 f'! v4l2sink name=v4l2 device=/dev/video{c["device"]} sync=false')
 
@@ -175,7 +207,8 @@ class Node:
                 f'! ndisrcdemux name=d d.video ! queue max-size-buffers=1 leaky=downstream '
                 f'! videoconvert n-threads=4 ! videoscale '
                 f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]} '
-                f'{rate}! intervideosink name=ivsink channel={CHANNEL} sync=false')
+                f'{rate}! {self.caps_shim()} '      # same tags as the output side → intervideosrc passes frames through untouched
+                f'! intervideosink name=ivsink channel={CHANNEL} sync=false')
 
     def start(self):
         if self.dry_run:
