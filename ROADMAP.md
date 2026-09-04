@@ -4,7 +4,7 @@
 declares itself as an NDI receiver, subscribes to an NDI source and exposes the
 video as a local V4L2 device that a browser page opens with `getUserMedia` and
 draws into a `<video>` / canvas / WebGL. First consumer: a Dropfile station running
-inside HKiosk on an N150 mini (Ubuntu 24.04, Pi-tools 2026 image).
+inside HKiosk on an N150 mini (Ubuntu 25.10, Pi-tools 2026 image).
 
 ```
 Resolume → NDI (LAN / WiFi bridge) → hndi-in (GStreamer) → /dev/video10 (v4l2loopback)
@@ -41,24 +41,32 @@ three repos and the hub on 2026-09-04; the decisions below supersede it.
 8. Repo public, **GPL-3** (like HKiosk). Names: `hndi-in.service`, `hndi` CLI,
    `/boot/hndi.conf`, `/data/var/hndi/`. API on `127.0.0.1:8791`.
 
-## Target platform facts (verified 2026-09-04)
+## Target platform facts (verified 2026-09-04 on hmini-001)
 
-- **Ubuntu 24.04 noble** on Beelink N100/N150: kernel 6.8, GStreamer **1.24.2**, systemd
-  255. Read-only root (Pi-tools `rorw`), `/data` rw. Runtime remount-ro is unreliable on
-  these minis → never rely on writing `/boot` or `/etc` at runtime; a reboot seals.
-- noble ships **no `gstreamer1.0-plugins-rs`**. `gst-plugin-ndi` (gst-plugins-rs) loads
-  `libndi` at runtime (`NDI_RUNTIME_DIR_V6`), supports SDK 5 and 6, exposes
-  `ndi-name`, `url-address`, `receiver-ndi-name`, `bandwidth`, `color-format`
-  (`uyvy-bgra` default), `timeout` (5000), `connect-timeout` (10000),
+- **hmini-001 = Minix Z150 (Intel N150, 16 GB, nvme)** at `10.2.6.5` on the KXKM LAN, a
+  production box lent as the bench. It runs **Ubuntu 25.10, kernel 6.17.0-40, GStreamer
+  1.26.6, Google Chrome 149**, Pi-tools `af53763`, Secure Boot disabled, 20 G root +
+  a **974 M `/data`** (too small for build trees — build under `/root/build`), on WiFi
+  (`wint`, eth0 unplugged), ufw inactive. The show fleet (IMA-Niort, 24/09/2026) is
+  4 Minix Z150 + 3 Beelink N150 cloned from the `hmini-000` golden image, so this is the
+  reference platform — **not** the 24.04 / GStreamer 1.24 base the hub's N100 notes
+  describe.
+- Read-only root (Pi-tools `rorw`), `/data` rw. Runtime remount-ro is unreliable on these
+  minis → never rely on writing `/boot` or `/etc` at runtime; a reboot seals. Bench work:
+  `rw` first, reboot at the end.
+- Ubuntu ships **no `gstreamer1.0-plugins-rs`**. `gst-plugin-ndi` (gst-plugins-rs, branch
+  0.14 for GStreamer 1.26) loads `libndi` at runtime (`NDI_RUNTIME_DIR_V6`), supports SDK 5
+  and 6, exposes `ndi-name`, `url-address`, `receiver-ndi-name`, `bandwidth`,
+  `color-format` (`uyvy-bgra` default), `timeout` (5000), `connect-timeout` (10000),
   `max-queue-length` (10), `timestamp-mode`; `ndisrcdemux` (rank primary) splits
-  `video` / `audio`; `ndideviceprovider` lists sources.
+  `video` / `audio`; `ndideviceprovider` lists sources. GitHub has no 25.10 hosted runner:
+  CI builds inside an `ubuntu:25.10` container on an `ubuntu-24.04` runner.
 - **NDI SDK v6 Linux** tarball downloads unattended:
   `https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz`
   (61 MB, refreshed 2026-04). The installer accepts the license; `libndi` is never
   vendored in the repo.
-- **v4l2loopback-dkms 0.12.7-2ubuntu5** in noble; 0.12.7 needed the `strlcpy` →
-  `strscpy` fix for 6.8. If the DKMS build fails, build upstream ≥ 0.13.1. **Secure
-  Boot** must be off (or a MOK enrolled) for any DKMS module: `mokutil --sb-state`.
+- **v4l2loopback-dkms 0.15.0** in 25.10 builds cleanly against 6.17 (bench 2026-09-04).
+  Any DKMS module needs Secure Boot off or a MOK enrolled: `mokutil --sb-state`.
 - Chrome (HKiosk x86 = Google Chrome `.deb`) accepts **UYVY and YUY2** from V4L2.
   `--auto-accept-camera-and-microphone-capture` exists as an alternative to the
   `VideoCaptureAllowedUrls` enterprise policy. HKiosk launches with
@@ -217,11 +225,11 @@ Idempotent. Offline: `NDI_SDK_TARBALL=… GST_NDI_SO=… ./install.sh`.
 
 ### CI `gst-ndi.yml`
 
-Runner `ubuntu-24.04` (GStreamer 1.24.2 = the fleet): apt gst dev packages, rustup
-stable, clone gst-plugins-rs at the branch matching 1.24 (0.13.x),
-`cargo build -p gst-plugin-ndi --release`, upload `libgstndi-gst1.24-x86_64.so` +
-`SHA256SUMS` and attach them to the tag's release. `workflow_dispatch` input for another
-gst minor (`ubuntu-26.04` → 1.28 when the fleet moves). LGPL asset; license text
+Runner `ubuntu-24.04` running the build inside an **`ubuntu:25.10` container** (GStreamer
+1.26 = the fleet): apt gst dev packages, rustup stable, clone gst-plugins-rs at the branch
+matching 1.26 (0.14), `cargo build -p gst-plugin-ndi --release`, upload
+`libgstndi-gst1.26-x86_64.so` + `SHA256SUMS` and attach them to the tag's release.
+`workflow_dispatch` input for another Ubuntu/gst pair when the fleet moves. LGPL asset; license text
 alongside.
 
 ---
@@ -230,9 +238,10 @@ alongside.
 
 ### Phase 0 — Bench on a real N150 (gate · ~½ day · field)
 
-Needs one N150 on the Pi-tools 2026 image (rw), an NDI sender on the same LAN
-(Resolume, or NDI Tools *Test Patterns* / OBS + NDI on a laptop), a monitor.
-`bench/phase0.sh` runs the steps; results go to `bench/README.md`.
+Runs on hmini-001 (rw, display attached). No external sender needed for the software
+pass: `bench/ndi-testsrc.sh` emits a test NDI stream from the same plugin; Resolume/OBS on
+the KXKM LAN come in for the network and latency legs. `bench/phase0.sh` runs the steps;
+results go to `bench/README.md`.
 
 1. deps + NDI runtime + plugin (cargo on the box the first time; CI asset afterwards) +
    loopback module.
@@ -378,10 +387,11 @@ multi-source (two loopback devices, PiP); an NDI Router recipe per box.
 
 ## Open items
 
-- **Timeline / first show** — which engagement is the first user and when? Decides
-  whether Phases 5–6 ship before or after the first field run.
-- **Bench hardware** — an N150 on the 2026 image plus an NDI sender reachable from
-  dev37 (ssh) lets Phase 0 be scripted remotely; otherwise Phase 0 is a bench session.
+- **Timeline** — first show is **IMA-Niort (KXKM), 24/09/2026**. Phases 0–4 must land
+  before; 5–6 as time allows. The minis may finally be driven from RPi-Regie/HPlayer2
+  rather than Dropfile as-is — parked until NDI injection works.
+- **Bench hardware** — hmini-001 (10.2.6.5, via rachael) since 2026-09-04; Resolume/OBS
+  on the KXKM LAN for the latency and WiFi legs when Thomas is on site.
 - **Hub** — create the `hndi` project in 37Projects (component, `uses: [pi-tools,
   hkiosk]`, consumer `dropfile`); Phase 0 is its first task.
 - **Sender-side recipe** — Resolume comp at LED-native size, fixed NDI output name,
