@@ -44,6 +44,11 @@ three repos and the hub on 2026-09-04; the decisions below supersede it.
   feed — `player-status.ndi.sources` relayed from boxes — is Phase 5; WiFi auto-bandwidth +
   audio are Phase 6).
 
+- **0.1.1 (2026-09-04) — idle-loop fix.** The first-resolve `GLib.idle_add` callback
+  returned `True`, so it re-ran forever: 100 % CPU in every state and, while resolving,
+  `get_devices()` leaking ~46 B per call — hmini-001 hit 13.9 G and was OOM-killed every
+  ~30 min. Now a one-shot idle; the 3 s timeout source is the only resolver.
+
 **Blocker for the release asset:** GitHub Actions is **disabled at the Hemisphere-Project
 org level**, so the `gst-ndi` workflow cannot run. Until an org admin enables Actions (org
 settings → Actions, or per-repo), `install.sh` builds the plugin on the box with cargo

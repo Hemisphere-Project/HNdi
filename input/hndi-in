@@ -34,7 +34,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, Gst  # noqa: E402
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 
 STATUS_PAGE = """<!DOCTYPE html><html><head><meta charset=utf-8><title>hndi-in</title>
 <meta name=viewport content="width=device-width,initial-scale=1"><style>
@@ -279,7 +279,11 @@ class Node:
         self._set_state('resolving')
         self._resolve_id = GLib.timeout_add_seconds(RESOLVE_INTERVAL_S, self._resolve_tick)
         GLib.timeout_add(1000, self._second_tick)
-        GLib.idle_add(self._resolve_tick)
+        # first resolve right away, ONCE. _resolve_tick returns True because it is a
+        # timeout source; an idle source that returns True is re-run forever — a 100 %
+        # CPU spin in every state, and get_devices() leaks a few bytes per call, so an
+        # idle box grew to 13.9 G and was OOM-killed every ~30 min (hmini-001, 2026-09-04).
+        GLib.idle_add(lambda: (self._resolve_tick(), False)[1])
 
     def stop(self):
         self._stop_input()
