@@ -67,12 +67,14 @@ three repos and the hub on 2026-09-04; the decisions below supersede it.
   vendored in the repo.
 - **v4l2loopback-dkms 0.15.0** in 25.10 builds cleanly against 6.17 (bench 2026-09-04).
   Any DKMS module needs Secure Boot off or a MOK enrolled: `mokutil --sb-state`.
-- Chrome (HKiosk x86 = Google Chrome `.deb`) accepts **UYVY and YUY2** from V4L2.
-  `--auto-accept-camera-and-microphone-capture` exists as an alternative to the
-  `VideoCaptureAllowedUrls` enterprise policy. HKiosk launches with
-  `--deny-permission-prompts` and `--disable-web-security`. Loopback (`127.0.0.1`,
-  `localhost`) is exempt from mixed-content blocking, so an https page may `fetch` the
-  local API.
+- Chrome (HKiosk x86 = Google Chrome `.deb`) does **not** list UYVY among its usable
+  V4L2 formats (bench 2026-09-04: a UYVY-only loopback is invisible to
+  `enumerateDevices`). **YUY2 works**: label `NDI`, 1920×1080@60, 60 fps in the page,
+  0 stalls. So the bridge converts NDI's UYVY to YUY2 (a byte swap in `videoconvert`).
+  `--auto-accept-camera-and-microphone-capture` grants `getUserMedia` with no prompt even
+  next to HKiosk's `--deny-permission-prompts` (bench 2026-09-04) — the enterprise policy
+  is the fallback, not the default. Loopback (`127.0.0.1`, `localhost`) is exempt from
+  mixed-content blocking, so an https page may `fetch` the local API.
 - **NDI is pull-based**: a receiver subscribes to a source; it only *advertises* its
   own name (`receiver-ndi-name`). Operator-side routing ("choose what a box shows from
   the Resolume side") = NDI Router (NDI Tools), one virtual source per box; the box
@@ -90,7 +92,7 @@ Python 3, PyGObject (`Gst` 1.0), stdlib `http.server`; runs as root under system
 
 ```
 intervideosrc channel=ndi timeout=<timeout ns>
-  ! video/x-raw,format=UYVY,width=W,height=H,framerate=F/1
+  ! video/x-raw,format=YUY2,width=W,height=H,framerate=F/1
   ! v4l2sink device=/dev/video10 sync=false
 ```
 
@@ -102,12 +104,12 @@ ndisrc ndi-name="<source>" receiver-ndi-name="<host> (HNdi)" bandwidth=<mode>
   ! ndisrcdemux name=d
   d.video ! queue max-size-buffers=1 leaky=downstream
           ! videoconvert n-threads=4 ! videoscale
-          ! video/x-raw,format=UYVY,width=W,height=H
+          ! video/x-raw,format=YUY2,width=W,height=H
           ! intervideosink channel=ndi
 ```
 
-`videorate` only when `fps` is pinned. `videoconvert`/`videoscale` are pass-through
-when the sender already delivers UYVY at W×H — the normal case with a LED-native comp.
+`videorate` only when `fps` is pinned. `videoscale` is pass-through when the sender already delivers W×H (LED-native comp);
+`videoconvert` does the UYVY→YUY2 byte swap Chrome needs.
 
 **Why two pipelines.** Chrome holds `/dev/video10` open and its caps must never
 change. Source loss, WiFi drops, source switching and bandwidth changes restart only
@@ -153,7 +155,7 @@ source =              # exact NDI name, e.g. "REGIE (Resolume Arena - Output)"; 
 width = 1920          # loopback caps (stable for Chrome). Prefer the LED-native size.
 height = 1080
 fps =                 # blank = passthrough; e.g. 60 inserts videorate
-format = UYVY         # NDI native. YUY2 if the bench shows Chrome needs it.
+format = YUY2         # what Chrome accepts from V4L2 (UYVY is not listed by Chrome)
 device = 10           # /dev/video10, card_label=NDI
 bandwidth = highest   # highest | lowest (NDI proxy stream) | auto (phase 6)
 timeout = 2000        # ms without a frame before black + input restart

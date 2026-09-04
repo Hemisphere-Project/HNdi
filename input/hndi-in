@@ -69,7 +69,7 @@ def load_config(path=None):
         'width': int(c.get('width') or 1920),
         'height': int(c.get('height') or 1080),
         'fps': int(fps) if fps else 0,
-        'format': (c.get('format').strip() or 'UYVY').upper(),
+        'format': (c.get('format').strip() or 'YUY2').upper(),
         'device': int(c.get('device') or 10),
         'bandwidth': (c.get('bandwidth').strip() or 'highest').lower(),
         'timeout_ms': int(c.get('timeout') or 2000),

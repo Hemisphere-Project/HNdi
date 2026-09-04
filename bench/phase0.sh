@@ -10,7 +10,7 @@
 # Env overrides: W H FPS FORMAT DEV NDI_NAME BUILD NDI_SDK_TARBALL GST_NDI_SO GST_RS_BRANCH
 set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-W="${W:-1920}"; H="${H:-1080}"; FPS="${FPS:-60}"; FORMAT="${FORMAT:-UYVY}"; DEV="${DEV:-10}"
+W="${W:-1920}"; H="${H:-1080}"; FPS="${FPS:-60}"; FORMAT="${FORMAT:-YUY2}"; DEV="${DEV:-10}"
 NDI_NAME="${NDI_NAME:-HNDI-TEST}"                 # the sender's short name (ndi-testsrc.sh)
 # NDI full names are "MACHINE (name)", machine upper-cased. Same-host default; override NDI_FULL= for a remote sender,
 # or NDI_ADDR=ip:port to connect directly without discovery.
