@@ -19,6 +19,21 @@ three repos and the hub on 2026-09-04; the decisions below supersede it.
 
 ---
 
+## Status (2026-09-04)
+
+- **Phase 0 — bench: PASSED** on hmini-001 (Minix Z150 / N150, Ubuntu 25.10). Live NDI in
+  Chrome via `getUserMedia` at a paced **60 fps**, format **YUY2**, permission via
+  `--auto-accept-camera-and-microphone-capture`. Numbers in [bench/README.md](bench/README.md).
+- **Phase 1 — input node: WORKING.** `hndi-in` daemon (two pipelines, state machine, HTTP
+  API, SSE), `hndi` CLI + `doctor`, config, installer + lib, CI workflow — all landed and
+  verified on the box (source resolve/connect/run, black-on-loss + auto-recover, `PUT/DELETE
+  /source`). Left to close the phase: tag a release so CI publishes the plugin asset, then a
+  field pass. The gst NDI plugin currently builds on the box with cargo (~1m30s).
+- **Phases 2–6** — not started (HKiosk `--capture`, then Dropfile model + player).
+
+Remaining Phase 0 field items (need Resolume/OBS on the KXKM LAN + the display): end-to-end
+**latency** by the photo method, and the **WiFi-bridge** degradation behaviour.
+
 ## Decisions locked (2026-09-04)
 
 1. **Transport into the browser = v4l2loopback + `getUserMedia`** — raw UYVY frames,
