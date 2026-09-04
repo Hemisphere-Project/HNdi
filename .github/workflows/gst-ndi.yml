@@ -1,0 +1,67 @@
+# Build the GStreamer NDI plugin (gst-plugins-rs `ndi`) for the fleet's Ubuntu/GStreamer
+# pair and attach it to the release. Ubuntu has no gstreamer1.0-plugins-rs package and
+# the plugin is locked to the GStreamer minor, so HNdi ships it as a release asset that
+# install.sh downloads (lib/install-gst-ndi.sh). Built inside an ubuntu:<ver> container
+# because GitHub has no 25.10 hosted runner.
+name: gst-ndi plugin
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ubuntu:
+        description: 'Ubuntu version (container tag)'
+        default: '25.10'
+      branch:
+        description: 'gst-plugins-rs branch (0.13 → gst 1.24, 0.14 → 1.26, 0.15 → 1.28)'
+        default: '0.14'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - ubuntu: ${{ github.event.inputs.ubuntu || '25.10' }}
+            branch: ${{ github.event.inputs.branch || '0.14' }}
+    container: ubuntu:${{ matrix.ubuntu }}
+    steps:
+      - name: deps
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq git curl build-essential pkg-config libssl-dev ca-certificates \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base
+          gst-inspect-1.0 --version
+      - name: rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: build gst-plugin-ndi
+        run: |
+          git clone --depth 1 -b "${{ matrix.branch }}" https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git
+          cd gst-plugins-rs && cargo build -p gst-plugin-ndi --release
+          MINOR=$(gst-inspect-1.0 --version | awk '/GStreamer/{split($2,a,"."); print a[1]"."a[2]}')
+          OUT="libgstndi-gst${MINOR}-$(uname -m).so"
+          cp target/release/libgstndi.so "../$OUT"
+          cd .. && sha256sum "$OUT" > "$OUT.sha256"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          gst-inspect-1.0 "./$OUT" | head -5
+      - name: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUT }}
+          path: |
+            ${{ env.OUT }}
+            ${{ env.OUT }}.sha256
+      - name: attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.OUT }}
+            ${{ env.OUT }}.sha256
+          body: |
+            gst-plugins-rs `ndi` plugin (LGPL-2.1) built from branch ${{ matrix.branch }} on ubuntu:${{ matrix.ubuntu }}.
+            Runtime needs libndi.so.6 from the NDI SDK (install.sh downloads it; never vendored here).
