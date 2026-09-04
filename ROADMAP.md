@@ -382,14 +382,35 @@ action, not the default.
 **Acceptance:** picking a source switches the box in ~3 s with no reload; the list
 shows the Resolume outputs seen on the LAN.
 
-### Phase 6 — Hardening and options (as needed · code + field)
+### Phase 6 — Hardening and options
 
-- **WiFi degradation** (`bandwidth = auto`): the daemon scores the link from
-  `fps_measured` and the stall count over a sliding 10 s window; ≥ 3 stalls or fps
-  < 50 % of expected → restart the input at `bandwidth=lowest` (NDI proxy stream) with
-  a 60 s cool-down; back to `highest` after 60 s clean. Sender-side notes in the README:
-  unicast TCP / RUDP, never multicast, over wireless; NDI Discovery Server across
-  bridged subnets (`[discovery] server`).
+**Done + validated on the bench (2026-09-04, tc netem / SIGSTOP harness):**
+- **R1 — ride out jitter & dropouts.** Split the single timeout into `stall_ms` (ride
+  out, keep the NDI receiver), `dead_ms` (reconnect), `hold_ms` (black-paint). A gap now
+  stays `state=running` with a `stalled` flag; only a truly dead link reconnects. Verified:
+  a 3 s freeze rides out with **zero restarts** (old 2 s timeout would have reconnected);
+  a 12 s freeze reconnects at 8 s; 200 ms±120 ms jitter and 15 % loss ride out (fps dips,
+  no restart). ndisrc timeout raised to a backstop so it no longer self-errors on jitter.
+- **C1 — `nosignal = slate`.** A "NO NDI SIGNAL / host / source" card feeds the device while
+  searching or reconnecting (also during a stalled connect), instead of black.
+- **C2 — observability.** A live status page at the API root (`http://127.0.0.1:8791/`),
+  `hndi status` shows the stalled state + recovery thresholds, `bench/netem.sh` injects
+  delay/jitter/loss/outage on the NDI flow only (ssh/API-safe) to validate recovery.
+
+**Next (not started):**
+- **R2 — jitter buffer + latency/robust profiles**: a small receive-side buffer to absorb
+  WiFi jitter, bundled as a `profile` (lowlatency = Ethernet, robust = WiFi bridge).
+- **R3 — `bandwidth = auto`**: the daemon scores the link from
+  `fps_measured` and the stall count over a sliding window; sustained degradation →
+  `bandwidth=lowest` (NDI proxy stream) with hysteresis/cool-down; back to `highest`
+  when clean. Sender-side: unicast TCP/RUDP over wireless, Discovery Server across subnets.
+- **R4 — player side**: (the bridge already reports `stalled` as `state=running`, so the
+  Dropfile player holds the feed through a ride-out with no change; verify reconnect
+  re-acquire under the netem harness).
+- **O1 — control-room health**: relay stall count / bandwidth / restarts to the Dropfile
+  status with a warning when a box degrades.
+- **B1/B2 (later)**: primary+fallback NDI source; rebuild the output pipeline in-process on
+  a v4l2 error instead of exiting.
 - **Audio:** `d.audio ! audioconvert ! interaudiosink` + persistent `interaudiosrc !
   alsasink` into audiohub's `snd-aloop`; Dropfile treats it like a stream's audio.
 - **Watchdog:** `restarts` and `last_frame_age_ms` surfaced in Dropfile status with
