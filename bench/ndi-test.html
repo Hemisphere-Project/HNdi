@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HNDI bench</title>
+<style>
+  html,body{margin:0;background:#000;color:#0f0;font:15px/1.4 monospace;height:100%;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh;object-fit:contain;background:#000}
+  video{display:none}
+  #hud{position:fixed;top:0;left:0;padding:8px 12px;background:rgba(0,0,0,.6);white-space:pre}
+  #hud b{color:#fff}.bad{color:#f55}.warn{color:#fd0}
+</style></head><body>
+<canvas id="c"></canvas><div id="hud">HNdi bench — starting…</div>
+<script>
+// Pick the NDI-labelled video input, getUserMedia it, draw each new frame to a
+// canvas (requestVideoFrameCallback), show fps / stalls / resolution in a HUD
+// and mirror them into document.title so `curl :9222/json` can read them.
+const LABEL = /NDI/i, WANT = 60;
+const hud = document.getElementById('hud'), cv = document.getElementById('c'), cx = cv.getContext('2d', {alpha:false});
+const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = true; document.body.appendChild(v);
+let frames = 0, fps = 0, fpsN = 0, stalls = 0, t0 = 0, tSec = performance.now(), tLast = performance.now(), label = '?', err = '';
+function say(s, cls){ hud.innerHTML = s; hud.className = cls || ''; }
+async function pick(){
+  let devs = await navigator.mediaDevices.enumerateDevices();
+  if (!devs.some(d => d.kind === 'videoinput' && d.label)) {
+    try { (await navigator.mediaDevices.getUserMedia({video:true})).getTracks().forEach(t => t.stop()); } catch (e) {}
+    devs = await navigator.mediaDevices.enumerateDevices();
+  }
+  const cams = devs.filter(d => d.kind === 'videoinput');
+  return cams.find(d => LABEL.test(d.label)) || cams[0];
+}
+async function start(){
+  try {
+    const dev = await pick();
+    if (!dev) { err = 'no videoinput device'; render(); return setTimeout(start, 2000); }
+    const s = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ deviceId:{exact:dev.deviceId}, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:WANT} } });
+    label = dev.label; err = ''; v.srcObject = s; await v.play().catch(() => {}); t0 = performance.now();
+    s.getVideoTracks()[0].onended = () => { err = 'track ended'; render(); setTimeout(start, 2000); };
+    tick();
+  } catch (e) { err = e.name + ': ' + e.message; render(); setTimeout(start, 2000); }
+}
+function render(){
+  const now = performance.now(), cls = err ? 'bad' : (fps === 0 ? 'bad' : (fps < WANT - 3 ? 'warn' : ''));
+  const line = `fps=${fps} res=${v.videoWidth}x${v.videoHeight} stalls=${stalls} frames=${frames}${err ? ' err=' + err : ''}`;
+  document.title = 'HNDI ' + line;
+  say(`<b>HNdi getUserMedia bench</b>\ndevice : ${label}\n${line.replace(/ /g, '\n')}\nuptime : ${t0 ? ((now - t0) / 1000).toFixed(1) : 0}s`, cls);
+}
+function tick(){
+  const now = performance.now(); frames++; fpsN++;
+  if (now - tLast > 250) stalls++; tLast = now;
+  if (now - tSec >= 1000) { fps = fpsN; fpsN = 0; tSec = now; render(); }
+  if (v.videoWidth) { if (cv.width !== v.videoWidth) { cv.width = v.videoWidth; cv.height = v.videoHeight; } cx.drawImage(v, 0, 0); }
+  v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+}
+start();
+</script></body></html>
