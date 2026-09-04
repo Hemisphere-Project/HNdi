@@ -11,7 +11,11 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 W="${W:-1920}"; H="${H:-1080}"; FPS="${FPS:-60}"; FORMAT="${FORMAT:-UYVY}"; DEV="${DEV:-10}"
-NDI_NAME="${NDI_NAME:-HNDI-TEST}"
+NDI_NAME="${NDI_NAME:-HNDI-TEST}"                 # the sender's short name (ndi-testsrc.sh)
+# NDI full names are "MACHINE (name)", machine upper-cased. Same-host default; override NDI_FULL= for a remote sender,
+# or NDI_URL=ip:port to connect directly without discovery.
+NDI_FULL="${NDI_FULL:-$(hostname | tr "[:lower:]" "[:upper:]") ($NDI_NAME)}"
+NDI_URL="${NDI_URL:-}"
 BUILD="${BUILD:-/root/build}"                 # NOT /data (974M) and NOT /var/tmp (tmpfs)
 LOG="${LOG:-/var/tmp/hndi-bench}"; mkdir -p "$LOG" "$BUILD"
 NDI_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz"
@@ -29,7 +33,7 @@ deps(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-base-apps libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
     v4l2loopback-dkms "linux-headers-$(uname -r)" v4l-utils \
     python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
     git curl build-essential pkg-config libssl-dev avahi-daemon
@@ -91,23 +95,26 @@ testsrc(){
 }
 
 discover(){
-  say "NDI discovery (gst-device-monitor, 8 s)"
-  timeout 8 gst-device-monitor-1.0 Source/Network:application/x-ndi 2>/dev/null | grep -E 'name  *:|ndi-name' | sed 's/^/   /' || echo "   (no sources listed)"
+  say "NDI discovery (gst-device-monitor, 8 s) — expecting '$NDI_FULL'"
+  command -v gst-device-monitor-1.0 >/dev/null || { bad "gst-device-monitor-1.0 missing (gstreamer1.0-plugins-base-apps)"; return 1; }
+  local out; out=$(timeout 8 gst-device-monitor-1.0 Source/Network:application/x-ndi 2>&1 | grep -E 'name  *:|url-address' | sed 's/^/   /')
+  [ -n "$out" ] && { echo "$out"; ok "$(echo "$out" | grep -c 'name') source(s)"; } || { bad "no NDI source listed (sender running? avahi-browse -rt _ndi._tcp)"; return 1; }
 }
 
 receive(){
-  say "receive '$NDI_NAME' → /dev/video$DEV as $FORMAT ${W}x${H}"
-  pkill -f "v4l2sink device=/dev/video$DEV" 2>/dev/null; sleep 0.5
+  local sel; if [ -n "$NDI_URL" ]; then sel="url-address=$NDI_URL"; else sel="ndi-name=$NDI_FULL"; fi
+  say "receive '${NDI_URL:-$NDI_FULL}' → /dev/video$DEV as $FORMAT ${W}x${H}"
+  pkill -f "gst-launch.*v4l2sink" 2>/dev/null; sleep 0.5
   nohup gst-launch-1.0 -e \
-    ndisrc ndi-name="$NDI_NAME" receiver-ndi-name="$(hostname) (HNdi bench)" timeout=5000 connect-timeout=10000 max-queue-length=2 \
+    ndisrc "$sel" receiver-ndi-name="$(hostname) (HNdi bench)" timeout=5000 connect-timeout=10000 max-queue-length=2 \
     ! ndisrcdemux name=d d.video ! queue max-size-buffers=1 leaky=downstream \
     ! videoconvert n-threads=4 ! videoscale \
     ! "video/x-raw,format=$FORMAT,width=$W,height=$H" \
     ! v4l2sink device="/dev/video$DEV" sync=false >"$LOG/receive.log" 2>&1 &
-  sleep 5
-  if pgrep -f "v4l2sink device=/dev/video$DEV" >/dev/null; then
-    ok "pipeline pid $(pgrep -f -n "v4l2sink device=/dev/video$DEV")"
-    v4l2-ctl -d "/dev/video$DEV" --get-fmt-video 2>/dev/null | sed 's/^/   /'
+  sleep 6
+  if pgrep -f "gst-launch.*v4l2sink" >/dev/null; then
+    ok "pipeline pid $(pgrep -f -n "gst-launch.*v4l2sink")"
+    v4l2-ctl -d "/dev/video$DEV" --get-fmt-video 2>&1 | grep -E 'Width|Pixel|Frames|VIDIOC' | sed 's/^/   /'
   else bad "see $LOG/receive.log"; tail -8 "$LOG/receive.log"; return 1; fi
 }
 
@@ -131,12 +138,12 @@ status(){
   printf '   gst %s · ndisrc %s · libndi %s · module %s · /dev/video%s %s\n' "$(gst_minor)" \
     "$(gst-inspect-1.0 ndisrc >/dev/null 2>&1 && echo yes || echo NO)" "$(ldconfig -p | grep -q libndi.so.6 && echo yes || echo NO)" \
     "$(lsmod | grep -q '^v4l2loopback' && echo loaded || echo NOT-loaded)" "$DEV" "$([ -e /dev/video$DEV ] && echo present || echo missing)"
-  printf '   testsrc %s · receive %s\n' "$(pgrep -f "ndisink ndi-name=$NDI_NAME" >/dev/null && echo running || echo stopped)" "$(pgrep -f "v4l2sink device=/dev/video$DEV" >/dev/null && echo running || echo stopped)"
+  printf '   testsrc %s · receive %s\n' "$(pgrep -f "ndisink ndi-name=$NDI_NAME" >/dev/null && echo running || echo stopped)" "$(pgrep -f "gst-launch.*v4l2sink" >/dev/null && echo running || echo stopped)"
   [ -e "/dev/video$DEV" ] && v4l2-ctl -d "/dev/video$DEV" --get-fmt-video 2>/dev/null | grep -E 'Width|Pixel' | sed 's/^/   /'
   hud
 }
 
-stop(){ say "stop bench pipelines"; pkill -f "v4l2sink device=/dev/video$DEV" 2>/dev/null; pkill -f "ndisink ndi-name=$NDI_NAME" 2>/dev/null; sleep 1; ok "stopped"; }
+stop(){ say "stop bench pipelines"; pkill -f "gst-launch.*v4l2sink" 2>/dev/null; pkill -f "ndisink ndi-name=$NDI_NAME" 2>/dev/null; sleep 1; ok "stopped"; }
 restore(){ stop; say "restore kiosk"; pkill -x Xorg 2>/dev/null; sleep 1; systemctl start kiosk && ok "kiosk.service started"; }
 
 run(){ testsrc && discover && receive && status; }
