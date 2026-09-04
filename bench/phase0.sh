@@ -13,9 +13,9 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 W="${W:-1920}"; H="${H:-1080}"; FPS="${FPS:-60}"; FORMAT="${FORMAT:-UYVY}"; DEV="${DEV:-10}"
 NDI_NAME="${NDI_NAME:-HNDI-TEST}"                 # the sender's short name (ndi-testsrc.sh)
 # NDI full names are "MACHINE (name)", machine upper-cased. Same-host default; override NDI_FULL= for a remote sender,
-# or NDI_URL=ip:port to connect directly without discovery.
+# or NDI_ADDR=ip:port to connect directly without discovery.
 NDI_FULL="${NDI_FULL:-$(hostname | tr "[:lower:]" "[:upper:]") ($NDI_NAME)}"
-NDI_URL="${NDI_URL:-}"
+NDI_ADDR="${NDI_ADDR:-}"
 BUILD="${BUILD:-/root/build}"                 # NOT /data (974M) and NOT /var/tmp (tmpfs)
 LOG="${LOG:-/var/tmp/hndi-bench}"; mkdir -p "$LOG" "$BUILD"
 NDI_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz"
@@ -97,13 +97,13 @@ testsrc(){
 discover(){
   say "NDI discovery (gst-device-monitor, 8 s) — expecting '$NDI_FULL'"
   command -v gst-device-monitor-1.0 >/dev/null || { bad "gst-device-monitor-1.0 missing (gstreamer1.0-plugins-base-apps)"; return 1; }
-  local out; out=$(timeout 8 gst-device-monitor-1.0 Source/Network:application/x-ndi 2>&1 | grep -E 'name  *:|url-address' | sed 's/^/   /')
+  local out; out=$(timeout -s INT 8 gst-device-monitor-1.0 Source/Network:application/x-ndi 2>&1 | grep -E 'name  *:|url-address' | sed 's/^/   /')
   [ -n "$out" ] && { echo "$out"; ok "$(echo "$out" | grep -c 'name') source(s)"; } || { bad "no NDI source listed (sender running? avahi-browse -rt _ndi._tcp)"; return 1; }
 }
 
 receive(){
-  local sel; if [ -n "$NDI_URL" ]; then sel="url-address=$NDI_URL"; else sel="ndi-name=$NDI_FULL"; fi
-  say "receive '${NDI_URL:-$NDI_FULL}' → /dev/video$DEV as $FORMAT ${W}x${H}"
+  local sel; if [ -n "$NDI_ADDR" ]; then sel="url-address=$NDI_ADDR"; else sel="ndi-name=$NDI_FULL"; fi
+  say "receive '${NDI_ADDR:-$NDI_FULL}' → /dev/video$DEV as $FORMAT ${W}x${H}"
   pkill -f "gst-launch.*v4l2sink" 2>/dev/null; sleep 0.5
   nohup gst-launch-1.0 -e \
     ndisrc "$sel" receiver-ndi-name="$(hostname) (HNdi bench)" timeout=5000 connect-timeout=10000 max-queue-length=2 \
