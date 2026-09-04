@@ -530,6 +530,11 @@ class Node:
         self.override = name
         if persist:
             self._save_override(name)
+        # already on air on a source that matches the new name: keep the feed — a show
+        # cue re-naming what is playing must not blank the wall for a reconnect
+        if self.state == 'running' and self.resolved and name and self._match(name, [self.resolved]):
+            log.info('source %r already on air as %r — no restart', name, self.resolved['name'])
+            return False
         self.restarts += 1
         self._stop_input()
         self._set_state('resolving')
