@@ -49,6 +49,11 @@ three repos and the hub on 2026-09-04; the decisions below supersede it.
   `get_devices()` leaking ~46 B per call — hmini-001 hit 13.9 G and was OOM-killed every
   ~30 min. Now a one-shot idle; the 3 s timeout source is the only resolver.
 
+- **0.1.2 (2026-09-04) — tolerant source match.** `source` (config, API, `.ndi` cue) now
+  matches the full NDI name, or the part in parentheses, or a case-insensitive fragment —
+  "HNDI-TEST" finds "KMINI-001 (HNDI-TEST)". Exact-only matching made a cue drop a running
+  feed and search forever.
+
 **Blocker for the release asset:** GitHub Actions is **disabled at the Hemisphere-Project
 org level**, so the `gst-ndi` workflow cannot run. Until an org admin enables Actions (org
 settings → Actions, or per-repo), `install.sh` builds the plugin on the box with cargo

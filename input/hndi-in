@@ -34,7 +34,7 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, Gst  # noqa: E402
 
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 
 STATUS_PAGE = """<!DOCTYPE html><html><head><meta charset=utf-8><title>hndi-in</title>
 <meta name=viewport content="width=device-width,initial-scale=1"><style>
@@ -319,11 +319,27 @@ class Node:
             return {'name': want, 'url': want}       # bare ip:port → direct, no discovery
         srcs = self.sources(max_age=0)
         if want:
-            for s in srcs:
-                if s['name'] == want:
-                    return s
-            return None
+            return self._match(want, srcs)
         return srcs[0] if srcs else None
+
+    @staticmethod
+    def _match(want, srcs):
+        """NDI advertises "MACHINE (source)"; an operator writes what they know — the
+        full name, just the part in parentheses, or a fragment. Exact wins, then the
+        "(want)" suffix, then a case-insensitive substring. (kmini-001, 2026-09-04: a cue
+        naming "HNDI-TEST" dropped a running "KMINI-001 (HNDI-TEST)" feed and searched
+        forever, because only the exact name matched.)"""
+        for s in srcs:
+            if s['name'] == want:
+                return s
+        for s in srcs:
+            if s['name'].endswith('(' + want + ')'):
+                return s
+        w = want.lower()
+        for s in srcs:
+            if w in s['name'].lower():
+                return s
+        return None
 
     def _resolve_tick(self):
         if self.state not in ('resolving', 'retrying'):
