@@ -397,18 +397,26 @@ shows the Resolume outputs seen on the LAN.
   `hndi status` shows the stalled state + recovery thresholds, `bench/netem.sh` injects
   delay/jitter/loss/outage on the NDI flow only (ssh/API-safe) to validate recovery.
 
+**Also done + validated (2026-09-04):**
+- **R2 — profiles + jitter buffer.** `profile = lowlatency` (default, Ethernet, tight queue)
+  or `robust` (WiFi: ~100 ms receive jitter buffer + deeper ndisrc queue). Verified both
+  pipelines via dry-run.
+- **R3 — `bandwidth = auto`.** While running, the daemon learns the healthy fps, scores
+  degradation, drops to the NDI proxy (`lowest`) under sustained trouble, and recovers to
+  `highest` after a sustained clean window — each switch a rate-limited input restart.
+  Verified: 40 % loss → dropped to lowest at score 5 in ~6 s; cleared → recovered after 35 s.
+- **R4 — reconnect is transparent to the browser.** Verified: a full `hndi-in` restart held
+  the page at 61 fps with no track-end (the persistent device + bridge-unreachable frame
+  fallback keep capture alive); an input-only reconnect never touches the device at all.
+- **O1 — control-room health.** The player forwards `stalled`, `restarts`, `bandwidth`,
+  `mode`; the Dropfile control room shows `● NDI · holding` on a ride-out and `● NDI · proxy`
+  when auto dropped to low bandwidth (amber). Deployed to drop.kxkm.net.
+
+Golden-image defaults stay conservative (`bandwidth=highest`, `profile=lowlatency`); a
+WiFi-bridged box opts into resilience by setting `profile=robust` + `bandwidth=auto` in its
+`/boot/hndi.conf`.
+
 **Next (not started):**
-- **R2 — jitter buffer + latency/robust profiles**: a small receive-side buffer to absorb
-  WiFi jitter, bundled as a `profile` (lowlatency = Ethernet, robust = WiFi bridge).
-- **R3 — `bandwidth = auto`**: the daemon scores the link from
-  `fps_measured` and the stall count over a sliding window; sustained degradation →
-  `bandwidth=lowest` (NDI proxy stream) with hysteresis/cool-down; back to `highest`
-  when clean. Sender-side: unicast TCP/RUDP over wireless, Discovery Server across subnets.
-- **R4 — player side**: (the bridge already reports `stalled` as `state=running`, so the
-  Dropfile player holds the feed through a ride-out with no change; verify reconnect
-  re-acquire under the netem harness).
-- **O1 — control-room health**: relay stall count / bandwidth / restarts to the Dropfile
-  status with a warning when a box degrades.
 - **B1/B2 (later)**: primary+fallback NDI source; rebuild the output pipeline in-process on
   a v4l2 error instead of exiting.
 - **Audio:** `d.audio ! audioconvert ! interaudiosink` + persistent `interaudiosrc !
