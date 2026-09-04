@@ -23,3 +23,30 @@ network leg is loopback here; the WiFi / Resolume legs are still to measure on s
 Run: `sudo bench/phase0.sh` (deps → runtime → plugin → loopback → sender → receiver), then
 `sudo bench/phase0.sh chrome`; `bench/cdp.py --title` reads the page HUD; `bench/phase0.sh restore`
 brings the kiosk back. Logs in `/var/tmp/hndi-bench/`.
+
+
+## Cross-machine latency — network + WiFi (2026-09-04)
+
+Source on **kxkm-dev** (wired, 10.2.0.137) → hmini-001 (**WiFi**) pulling it, vs the same
+source in loopback on hmini. Same sender both times (a pure-ctypes libndi sender, 1280×720
+BGRA, wall-clock burned in) so the delta isolates the network path. Clocks aligned to ~0.3 ms
+(measured), so no correction. hndi-in pointed directly at `ndi://ip:port` (NDI mDNS did not
+cross the subnets).
+
+| Path | samples (ms) | median |
+|---|---|---|
+| loopback (same box) | 67 81 61 66 67 63 | ~66 |
+| kxkm-dev (wired) → hmini (WiFi) | 76 77 77 63 76 80 | ~76 |
+
+**Network + WiFi ≈ 10 ms** at 720p60 on a healthy, quiet link. Caveats: this is a best-case
+WiFi number (idle bench); under congestion or a weak signal the WiFi hop grows and gets
+jittery — that is the robustness case `bandwidth=lowest` / Phase 6 auto-bandwidth exist for.
+Resolume's own NDI encode adds sender-side latency not captured here.
+
+**Sender dominates — the earlier ~130 ms was sender-dependent.** That figure used a GStreamer
+test sender (appsrc → ndisinkcombiner → ndisink, with pacing + queues adding ~50–60 ms on the
+send side). The lean ctypes sender gives ~66 ms loopback to Chrome canvas. So the receiver
+path we control (ndisrc → v4l2loopback → Chrome capture → canvas) is ~66 ms including Chrome's
+capture buffer; with a real optimized sender (Resolume) expect roughly **70–90 ms glass-to-
+canvas**, plus the monitor's own 1–2 frames. The dominant fixed cost on our side is Chrome's
+getUserMedia capture buffer; the network is minor on a good link.
