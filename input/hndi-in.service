@@ -1,0 +1,20 @@
+[Unit]
+Description=HNdi input node (NDI → /dev/video10 → browser)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment=NDI_RUNTIME_DIR_V6=/usr/local/lib
+Environment=NDI_CONFIG_DIR=/data/var/hndi/ndi
+ExecStartPre=-/sbin/modprobe v4l2loopback
+ExecStart=/usr/local/bin/hndi-in
+Restart=always
+RestartSec=5
+KillMode=mixed
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

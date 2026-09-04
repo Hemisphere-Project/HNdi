@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+"""hndi-in — HNdi input node.
+
+Subscribes to an NDI source and feeds it into a v4l2loopback device so a browser
+page can getUserMedia() it. Two GStreamer pipelines in one process:
+
+  output (persistent)  : intervideosrc → caps → v4l2sink /dev/videoN
+  input  (restartable) : ndisrc → ndisrcdemux → convert/scale → intervideosink
+
+The output side never restarts while the daemon lives, so Chrome's device keeps
+its caps and keeps ticking (black after `timeout` without frames). Source loss,
+source switching and bandwidth changes restart only the input side.
+
+Local HTTP API on 127.0.0.1:<api_port> (see ROADMAP.md): GET /status, /sources,
+/events (SSE); PUT /source {name, persist}; DELETE /source; PUT /bandwidth {mode}.
+
+Python 3 stdlib + PyGObject only. Runs as root under systemd (hndi-in.service).
+"""
+import argparse
+import configparser
+import json
+import logging
+import os
+import queue
+import signal
+import socket
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import GLib, Gst  # noqa: E402
+
+VERSION = '0.1.0'
+CONF_PATHS = ['/boot/firmware/hndi.conf', '/boot/hndi.conf']
+STATE_DIRS = ['/data/var/hndi', '/var/tmp/hndi']
+CHANNEL = 'hndi'
+RESOLVE_INTERVAL_S = 3
+log = logging.getLogger('hndi-in')
+
+
+# ── config ────────────────────────────────────────────────────────────────
+DEFAULTS = {
+    'input': {
+        'source': '', 'width': '1920', 'height': '1080', 'fps': '', 'format': 'UYVY',
+        'device': '10', 'bandwidth': 'highest', 'timeout': '2000', 'receiver_name': '',
+        'nosignal': 'black', 'api_port': '8791',
+    },
+    'discovery': {'server': ''},
+}
+
+
+def load_config(path=None):
+    cfg = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
+    cfg.read_dict(DEFAULTS)
+    used = None
+    for p in ([path] if path else CONF_PATHS):
+        if p and os.path.isfile(p):
+            cfg.read(p)
+            used = p
+            break
+    c = cfg['input']
+    fps = c.get('fps').strip()
+    conf = {
+        'path': used,
+        'source': c.get('source').strip(),
+        'width': int(c.get('width') or 1920),
+        'height': int(c.get('height') or 1080),
+        'fps': int(fps) if fps else 0,
+        'format': (c.get('format').strip() or 'UYVY').upper(),
+        'device': int(c.get('device') or 10),
+        'bandwidth': (c.get('bandwidth').strip() or 'highest').lower(),
+        'timeout_ms': int(c.get('timeout') or 2000),
+        'receiver_name': c.get('receiver_name').strip() or f'{socket.gethostname()} (HNdi)',
+        'nosignal': c.get('nosignal').strip() or 'black',
+        'api_port': int(c.get('api_port') or 8791),
+        'discovery_server': cfg['discovery'].get('server').strip(),
+    }
+    if conf['bandwidth'] not in ('highest', 'lowest', 'auto'):
+        conf['bandwidth'] = 'highest'
+    return conf
+
+
+def state_dir():
+    for d in STATE_DIRS:
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except OSError:
+            pass
+    return '/tmp'
+
+
+def write_ndi_config(conf, sdir):
+    """libndi reads $NDI_CONFIG_DIR/ndi-config.v1.json; the service sets NDI_CONFIG_DIR."""
+    d = os.path.join(sdir, 'ndi')
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, 'ndi-config.v1.json')
+    doc = {'ndi': {'networks': {'discovery': conf['discovery_server'], 'ips': ''},
+                   'rudp': {'send': {'enable': True}, 'recv': {'enable': True}}}}
+    try:
+        with open(p, 'w') as f:
+            json.dump(doc, f, indent=1)
+    except OSError as e:
+        log.warning('cannot write %s: %s', p, e)
+
+
+# ── node ──────────────────────────────────────────────────────────────────
+class Node:
+    def __init__(self, conf, sdir, dry_run=False):
+        self.conf = conf
+        self.sdir = sdir
+        self.state_file = os.path.join(sdir, 'state.json')
+        self.lock = threading.Lock()
+        self.loop = GLib.MainLoop()
+        self.state = 'stopped'
+        self.override = self._load_override()
+        self.bandwidth = conf['bandwidth']
+        self.resolved = None          # {'name', 'url'} of the source we are connected to
+        self.frames = 0
+        self.fps_measured = 0.0
+        self._fps_frames = 0
+        self._fps_t = time.monotonic()
+        self.last_frame_t = None
+        self.restarts = 0
+        self.started_at = time.time()
+        self.out_pipe = None
+        self.in_pipe = None
+        self.monitor = None
+        self._sources_cache = ([], 0.0)
+        self._resolve_id = None
+        self._sse = []                # list of queue.Queue
+        self.dry_run = dry_run
+
+    # persisted override ------------------------------------------------
+    def _load_override(self):
+        try:
+            with open(self.state_file) as f:
+                return (json.load(f).get('source') or '').strip()
+        except (OSError, ValueError):
+            return ''
+
+    def _save_override(self, name):
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump({'source': name, 'saved_at': time.time()}, f)
+        except OSError as e:
+            log.warning('cannot persist override: %s', e)
+
+    def wanted_source(self):
+        return self.override or self.conf['source']
+
+    # pipelines ---------------------------------------------------------
+    def out_desc(self):
+        c = self.conf
+        fps = c['fps'] or 60
+        return (f'intervideosrc channel={CHANNEL} timeout={c["timeout_ms"] * 1000000} '
+                f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]},framerate={fps}/1 '
+                f'! queue max-size-buffers=2 leaky=downstream '
+                f'! v4l2sink name=v4l2 device=/dev/video{c["device"]} sync=false')
+
+    def in_desc(self, src):
+        c = self.conf
+        bw = 'lowest' if self.bandwidth == 'lowest' else 'highest'
+        if src.get('url'):
+            sel = f'url-address="{src["url"]}"'
+        else:
+            sel = f'ndi-name="{src["name"]}"'
+        rate = f'! videorate ! video/x-raw,framerate={c["fps"]}/1 ' if c['fps'] else ''
+        return (f'ndisrc {sel} receiver-ndi-name="{c["receiver_name"]}" bandwidth={bw} '
+                f'timeout={c["timeout_ms"]} connect-timeout=10000 max-queue-length=2 color-format=uyvy-bgra '
+                f'! ndisrcdemux name=d d.video ! queue max-size-buffers=1 leaky=downstream '
+                f'! videoconvert n-threads=4 ! videoscale '
+                f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]} '
+                f'{rate}! intervideosink name=ivsink channel={CHANNEL} sync=false')
+
+    def start(self):
+        if self.dry_run:
+            print('output:', self.out_desc())
+            print('input :', self.in_desc({'name': self.wanted_source() or '<first source found>'}))
+            return
+        self.out_pipe = Gst.parse_launch(self.out_desc())
+        bus = self.out_pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self._on_out_error)
+        if self.out_pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise SystemExit('output pipeline failed to start (is /dev/video%d a v4l2loopback device?)' % self.conf['device'])
+        log.info('output pipeline up: /dev/video%d %s %dx%d', self.conf['device'], self.conf['format'], self.conf['width'], self.conf['height'])
+        self.monitor = Gst.DeviceMonitor()
+        self.monitor.add_filter('Source/Network', Gst.Caps.from_string('application/x-ndi'))
+        self.monitor.start()
+        self._set_state('resolving')
+        self._resolve_id = GLib.timeout_add_seconds(RESOLVE_INTERVAL_S, self._resolve_tick)
+        GLib.timeout_add(1000, self._second_tick)
+        GLib.idle_add(self._resolve_tick)
+
+    def stop(self):
+        self._stop_input()
+        if self.out_pipe:
+            self.out_pipe.set_state(Gst.State.NULL)
+            self.out_pipe = None
+        if self.monitor:
+            self.monitor.stop()
+        self._set_state('stopped')
+        self.loop.quit()
+
+    # discovery ---------------------------------------------------------
+    def sources(self, max_age=10.0):
+        lst, t = self._sources_cache
+        if time.monotonic() - t < max_age and lst:
+            return lst
+        out = []
+        if self.monitor:
+            for d in self.monitor.get_devices():
+                props = d.get_properties()
+                name = (props.get_string('ndi-name') if props and props.has_field('ndi-name') else None) or d.get_display_name()
+                url = props.get_string('url-address') if props and props.has_field('url-address') else ''
+                out.append({'name': name, 'url': url or ''})
+        self._sources_cache = (out, time.monotonic())
+        return out
+
+    def _pick(self):
+        want = self.wanted_source()
+        if want.startswith('ndi://'):
+            return {'name': want, 'url': want[6:]}
+        if want and ':' in want and want.replace('.', '').replace(':', '').isdigit():
+            return {'name': want, 'url': want}       # bare ip:port → direct, no discovery
+        srcs = self.sources(max_age=0)
+        if want:
+            for s in srcs:
+                if s['name'] == want:
+                    return s
+            return None
+        return srcs[0] if srcs else None
+
+    def _resolve_tick(self):
+        if self.state not in ('resolving', 'retrying'):
+            return True
+        src = self._pick()
+        if not src:
+            if self.state != 'resolving':
+                self._set_state('resolving')
+            return True
+        self._start_input(src)
+        return True
+
+    # input pipeline ----------------------------------------------------
+    def _start_input(self, src):
+        self._stop_input()
+        desc = self.in_desc(src)
+        log.info('connecting to %s (%s) bandwidth=%s', src['name'], src.get('url') or 'discovered', self.bandwidth)
+        try:
+            self.in_pipe = Gst.parse_launch(desc)
+        except GLib.Error as e:
+            log.error('input pipeline parse error: %s', e)
+            self._set_state('retrying')
+            return
+        bus = self.in_pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self._on_in_error)
+        bus.connect('message::eos', self._on_in_eos)
+        sink = self.in_pipe.get_by_name('ivsink')
+        sink.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self._on_frame, None)
+        self.resolved = src
+        self.last_frame_t = None
+        self._set_state('connecting')
+        if self.in_pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            log.error('input pipeline refused to start')
+            self._schedule_retry()
+
+    def _stop_input(self):
+        if self.in_pipe:
+            self.in_pipe.set_state(Gst.State.NULL)
+            self.in_pipe = None
+
+    def _schedule_retry(self):
+        self._stop_input()
+        self.restarts += 1
+        self._set_state('retrying')
+
+    def _on_frame(self, pad, info, _):
+        self.frames += 1
+        self._fps_frames += 1
+        self.last_frame_t = time.monotonic()
+        if self.state == 'connecting':
+            GLib.idle_add(self._set_state, 'running')
+        return Gst.PadProbeReturn.OK
+
+    def _on_in_error(self, bus, msg):
+        err, dbg = msg.parse_error()
+        log.warning('input error: %s (%s)', err.message, (dbg or '').splitlines()[0] if dbg else '')
+        self._schedule_retry()
+
+    def _on_in_eos(self, bus, msg):
+        log.warning('input EOS')
+        self._schedule_retry()
+
+    def _on_out_error(self, bus, msg):
+        err, _ = msg.parse_error()
+        log.error('OUTPUT pipeline error: %s — exiting so systemd restarts us', err.message)
+        self.stop()
+
+    def _second_tick(self):
+        now = time.monotonic()
+        dt = now - self._fps_t
+        if dt >= 1.0:
+            self.fps_measured = round(self._fps_frames / dt, 1)
+            self._fps_frames = 0
+            self._fps_t = now
+        if self.state == 'running' and self.last_frame_t and (now - self.last_frame_t) * 1000 > self.conf['timeout_ms']:
+            log.warning('no frame for %d ms — restarting input', self.conf['timeout_ms'])
+            self._schedule_retry()
+        elif self.state == 'connecting' and self.last_frame_t is None and self.in_pipe and (now - self._state_t) > 15:
+            log.warning('no first frame after 15 s — restarting input')
+            self._schedule_retry()
+        self._push_sse(heartbeat=True)
+        return True
+
+    # state / status ----------------------------------------------------
+    def _set_state(self, s):
+        if s != self.state:
+            log.info('state %s → %s', self.state, s)
+            self.state = s
+            self._state_t = time.monotonic()
+            self._push_sse()
+        else:
+            self._state_t = getattr(self, '_state_t', time.monotonic())
+        return False
+
+    def snapshot(self):
+        c = self.conf
+        now = time.monotonic()
+        return {
+            'node': 'input', 'version': VERSION, 'state': self.state,
+            'source': {'configured': c['source'], 'override': self.override,
+                       'resolved': self.resolved['name'] if self.resolved else '',
+                       'url': (self.resolved or {}).get('url', '')},
+            'receiver': c['receiver_name'], 'width': c['width'], 'height': c['height'],
+            'fps': c['fps'] or None, 'fps_measured': self.fps_measured, 'format': c['format'],
+            'device': f'/dev/video{c["device"]}', 'bandwidth': self.bandwidth,
+            'frames': self.frames, 'restarts': self.restarts,
+            'last_frame_age_ms': int((now - self.last_frame_t) * 1000) if self.last_frame_t else None,
+            'uptime_s': int(time.time() - self.started_at), 'config': c['path'],
+        }
+
+    # mutations (called on the GLib thread via idle_add) -----------------
+    def set_source(self, name, persist):
+        name = (name or '').strip()
+        log.info('set source %r persist=%s', name, persist)
+        self.override = name
+        if persist:
+            self._save_override(name)
+        self.restarts += 1
+        self._stop_input()
+        self._set_state('resolving')
+        self._resolve_tick()
+        return False
+
+    def reset_source(self):
+        return self.set_source('', True)
+
+    def set_bandwidth(self, mode):
+        mode = (mode or '').lower()
+        if mode not in ('highest', 'lowest', 'auto'):
+            return False
+        if mode == 'auto':
+            log.info('bandwidth auto: not implemented yet (phase 6) — behaving as highest')
+        self.bandwidth = mode
+        if self.resolved:
+            self._start_input(self.resolved)
+        return False
+
+    # SSE ---------------------------------------------------------------
+    def sse_subscribe(self):
+        q = queue.Queue(maxsize=50)
+        with self.lock:
+            self._sse.append(q)
+        return q
+
+    def sse_unsubscribe(self, q):
+        with self.lock:
+            if q in self._sse:
+                self._sse.remove(q)
+
+    def _push_sse(self, heartbeat=False):
+        with self.lock:
+            qs = list(self._sse)
+        if not qs:
+            return
+        ev = ('heartbeat' if heartbeat else 'status', self.snapshot())
+        for q in qs:
+            try:
+                q.put_nowait(ev)
+            except queue.Full:
+                pass
+
+
+# ── API ───────────────────────────────────────────────────────────────────
+def make_handler(node):
+    class H(BaseHTTPRequestHandler):
+        server_version = f'hndi-in/{VERSION}'
+
+        def log_message(self, fmt, *args):
+            log.debug('api ' + fmt, *args)
+
+        def _cors(self):
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+
+        def _json(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self._cors()
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _body(self):
+            n = int(self.headers.get('Content-Length') or 0)
+            try:
+                return json.loads(self.rfile.read(n) or b'{}')
+            except ValueError:
+                return {}
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == '/status':
+                return self._json(200, node.snapshot())
+            if self.path == '/sources':
+                return self._json(200, node.sources())
+            if self.path == '/events':
+                return self._events()
+            self._json(404, {'error': 'not found'})
+
+        def do_PUT(self):
+            b = self._body()
+            if self.path == '/source':
+                if not isinstance(b.get('name', ''), str):
+                    return self._json(400, {'error': 'name must be a string'})
+                GLib.idle_add(node.set_source, b.get('name', ''), bool(b.get('persist')))
+                return self._json(202, {'ok': True, 'name': b.get('name', ''), 'persist': bool(b.get('persist'))})
+            if self.path == '/bandwidth':
+                if b.get('mode') not in ('highest', 'lowest', 'auto'):
+                    return self._json(400, {'error': 'mode must be highest|lowest|auto'})
+                GLib.idle_add(node.set_bandwidth, b['mode'])
+                return self._json(202, {'ok': True, 'mode': b['mode']})
+            self._json(404, {'error': 'not found'})
+
+        def do_DELETE(self):
+            if self.path == '/source':
+                GLib.idle_add(node.reset_source)
+                return self._json(202, {'ok': True})
+            self._json(404, {'error': 'not found'})
+
+        def _events(self):
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            q = node.sse_subscribe()
+            try:
+                self.wfile.write(b'event: status\ndata: ' + json.dumps(node.snapshot()).encode() + b'\n\n')
+                self.wfile.flush()
+                while True:
+                    try:
+                        kind, data = q.get(timeout=5)
+                    except queue.Empty:
+                        kind, data = 'heartbeat', {'t': time.time()}
+                    self.wfile.write(f'event: {kind}\ndata: {json.dumps(data)}\n\n'.encode())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                node.sse_unsubscribe(q)
+    return H
+
+
+def serve_api(node, port):
+    srv = ThreadingHTTPServer(('127.0.0.1', port), make_handler(node))
+    srv.daemon_threads = True
+    t = threading.Thread(target=srv.serve_forever, name='api', daemon=True)
+    t.start()
+    log.info('API on http://127.0.0.1:%d', port)
+    return srv
+
+
+# ── main ──────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(description='HNdi input node: NDI → v4l2loopback + local API')
+    ap.add_argument('--config', help='INI file (default: /boot/firmware/hndi.conf or /boot/hndi.conf)')
+    ap.add_argument('--port', type=int, help='API port override')
+    ap.add_argument('--dry-run', action='store_true', help='print the pipelines and exit')
+    ap.add_argument('-v', '--verbose', action='store_true')
+    a = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO, format='%(levelname)s %(message)s', stream=sys.stderr)
+
+    conf = load_config(a.config)
+    if a.port:
+        conf['api_port'] = a.port
+    sdir = state_dir()
+    log.info('hndi-in %s · config %s · state %s', VERSION, conf['path'] or '(defaults)', sdir)
+    write_ndi_config(conf, sdir)
+    os.environ.setdefault('NDI_CONFIG_DIR', os.path.join(sdir, 'ndi'))
+    Gst.init(None)
+    if not Gst.ElementFactory.find('ndisrc'):
+        log.error('ndisrc element missing — is the gst NDI plugin installed? (hndi doctor)')
+        if not a.dry_run:
+            sys.exit(3)
+    node = Node(conf, sdir, dry_run=a.dry_run)
+    node.start()
+    if a.dry_run:
+        return
+    serve_api(node, conf['api_port'])
+    for s in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, s, lambda *_: (node.stop(), False)[1])
+    try:
+        node.loop.run()
+    finally:
+        node.stop()
+
+
+if __name__ == '__main__':
+    main()

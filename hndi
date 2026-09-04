@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""hndi — CLI for the HNdi nodes (talks to the local API of hndi-in).
+
+  hndi status [--json]              hndi sources
+  hndi in source "<name>" [--persist]   hndi in source --reset
+  hndi in bandwidth highest|lowest|auto hndi in restart   hndi in log
+  hndi doctor                       # runtime, plugin, module, device, boot, firewall
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+
+PORT = int(os.environ.get('HNDI_API_PORT', '8791'))
+BASE = f'http://127.0.0.1:{PORT}'
+
+
+def api(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read() or b'{}')
+    except urllib.error.URLError as e:
+        sys.exit(f'hndi-in not reachable on {BASE} ({e.reason}) — systemctl status hndi-in')
+
+
+def cmd_status(args):
+    s = api('GET', '/status')
+    if '--json' in args:
+        print(json.dumps(s, indent=1)); return
+    src = s['source']
+    print(f"hndi-in {s['version']}  state: {s['state']}   uptime {s['uptime_s']}s   restarts {s['restarts']}")
+    print(f"source : {src['resolved'] or '-'}   (configured: {src['configured'] or 'first found'}{'; override: ' + src['override'] if src['override'] else ''})")
+    print(f"device : {s['device']}  {s['format']} {s['width']}x{s['height']}  fps {s['fps'] or 'passthrough'}  measured {s['fps_measured']}")
+    print(f"link   : bandwidth {s['bandwidth']}   frames {s['frames']}   last frame {s['last_frame_age_ms'] if s['last_frame_age_ms'] is not None else '-'} ms ago")
+    print(f"as     : {s['receiver']}   config {s['config'] or '(defaults)'}")
+
+
+def cmd_sources(args):
+    for s in api('GET', '/sources'):
+        print(f"{s['name']}    {s['url']}")
+
+
+def cmd_in(args):
+    if not args:
+        sys.exit(__doc__)
+    sub, rest = args[0], args[1:]
+    if sub == 'source':
+        if not rest:
+            print(api('GET', '/status')['source']); return
+        if rest[0] == '--reset':
+            print(api('DELETE', '/source')); return
+        print(api('PUT', '/source', {'name': rest[0], 'persist': '--persist' in rest}))
+    elif sub == 'bandwidth':
+        print(api('PUT', '/bandwidth', {'mode': rest[0] if rest else ''}))
+    elif sub == 'restart':
+        os.execvp('systemctl', ['systemctl', 'restart', 'hndi-in'])
+    elif sub == 'log':
+        os.execvp('journalctl', ['journalctl', '-u', 'hndi-in', '-n', '100', '-f'])
+    else:
+        sys.exit(__doc__)
+
+
+def cmd_doctor(args):
+    def row(name, ok, detail=''):
+        print(f"{'ok ' if ok else 'BAD'}  {name:<26} {detail}")
+    out = subprocess.run(['ldconfig', '-p'], capture_output=True, text=True).stdout
+    row('libndi.so.6', 'libndi.so.6' in out, next((l.strip() for l in out.splitlines() if 'libndi.so.6' in l), ''))
+    r = subprocess.run(['gst-inspect-1.0', 'ndisrc'], capture_output=True, text=True)
+    row('gst ndisrc', r.returncode == 0, subprocess.run(['gst-inspect-1.0', '--version'], capture_output=True, text=True).stdout.splitlines()[0] if shutil.which('gst-inspect-1.0') else 'gstreamer missing')
+    mods = open('/proc/modules').read() if os.path.exists('/proc/modules') else ''
+    row('v4l2loopback module', 'v4l2loopback ' in mods)
+    dev = '/dev/video10'
+    try:
+        with open('/boot/hndi.conf') as f:
+            for l in f:
+                if l.strip().startswith('device'):
+                    dev = '/dev/video' + l.split('=', 1)[1].split('#')[0].strip()
+    except OSError:
+        pass
+    row(dev, os.path.exists(dev), subprocess.run(['v4l2-ctl', '-d', dev, '--get-fmt-video'], capture_output=True, text=True).stdout.replace('\n', ' ')[:80] if os.path.exists(dev) and shutil.which('v4l2-ctl') else '')
+    sb = subprocess.run(['mokutil', '--sb-state'], capture_output=True, text=True).stdout.strip() if shutil.which('mokutil') else 'mokutil missing'
+    row('secure boot', 'disabled' in sb.lower() or 'missing' in sb, sb)
+    ufw = subprocess.run(['ufw', 'status'], capture_output=True, text=True).stdout.splitlines()[0] if shutil.which('ufw') else 'ufw absent'
+    row('firewall', 'inactive' in ufw or 'absent' in ufw or '5960' in ufw, ufw)
+    row('config', any(os.path.exists(p) for p in ('/boot/firmware/hndi.conf', '/boot/hndi.conf')), '/boot/hndi.conf')
+    act = subprocess.run(['systemctl', 'is-active', 'hndi-in'], capture_output=True, text=True).stdout.strip()
+    row('hndi-in.service', act == 'active', act)
+    try:
+        s = api('GET', '/status'); row('api', True, f"state {s['state']}, source {s['source']['resolved'] or '-'}")
+    except SystemExit as e:
+        row('api', False, str(e))
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ('-h', '--help'):
+        print(__doc__); return
+    {'status': cmd_status, 'sources': cmd_sources, 'in': cmd_in, 'doctor': cmd_doctor}.get(a[0], lambda _: sys.exit(__doc__))(a[1:])
+
+
+if __name__ == '__main__':
+    main()
