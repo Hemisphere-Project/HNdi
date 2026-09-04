@@ -82,7 +82,12 @@ def cmd_doctor(args):
                     dev = '/dev/video' + l.split('=', 1)[1].split('#')[0].strip()
     except OSError:
         pass
-    row(dev, os.path.exists(dev), subprocess.run(['v4l2-ctl', '-d', dev, '--get-fmt-video'], capture_output=True, text=True).stdout.replace('\n', ' ')[:80] if os.path.exists(dev) and shutil.which('v4l2-ctl') else '')
+    fmt = ''
+    if os.path.exists(dev) and shutil.which('v4l2-ctl'):
+        r = subprocess.run(['v4l2-ctl', '-d', dev, '--get-fmt-video'], capture_output=True, text=True)
+        m = [l.strip() for l in r.stdout.splitlines() if 'Pixel Format' in l or 'Width/Height' in l]
+        fmt = '; '.join(m) if m else '(present, no writer attached)'
+    row(dev, os.path.exists(dev), fmt)
     sb = subprocess.run(['mokutil', '--sb-state'], capture_output=True, text=True).stdout.strip() if shutil.which('mokutil') else 'mokutil missing'
     row('secure boot', 'disabled' in sb.lower() or 'missing' in sb, sb)
     ufw = subprocess.run(['ufw', 'status'], capture_output=True, text=True).stdout.splitlines()[0] if shutil.which('ufw') else 'ufw absent'
