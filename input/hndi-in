@@ -192,11 +192,11 @@ class Node:
                 f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]},framerate={fps}/1 '
                 f'! {self.caps_shim()} '
                 f'! queue max-size-buffers=2 leaky=downstream '
-                f'! v4l2sink name=v4l2 device=/dev/video{c["device"]} sync=false')
+                f'! v4l2sink name=v4l2 device=/dev/video{c["device"]} sync=true')   # sync=true: the sink paces intervideosrc at the caps framerate
 
     def in_desc(self, src):
         c = self.conf
-        bw = 'lowest' if self.bandwidth == 'lowest' else 'highest'
+        bw = 0 if self.bandwidth == 'lowest' else 100          # ndisrc bandwidth is an int: 100 = highest, 0 = lowest (NDI proxy)
         if src.get('url'):
             sel = f'url-address="{src["url"]}"'
         else:
