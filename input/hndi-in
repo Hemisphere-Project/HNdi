@@ -82,7 +82,7 @@ DEFAULTS = {
         'device': '10', 'bandwidth': 'highest', 'receiver_name': '',
         'hold_ms': '', 'stall_ms': '800', 'dead_ms': '8000', 'timeout': '2000',  # timeout = legacy alias for hold_ms
         'profile': 'lowlatency', 'jitter_ms': '',   # lowlatency (Ethernet) | robust (WiFi jitter buffer)
-        'nosignal': 'black', 'api_port': '8791',
+        'nosignal': 'black', 'api_port': '8791', 'api_bind': '127.0.0.1',   # api_bind 0.0.0.0 = LAN-visible (a Régie on another box lists our sources)
     },
     'discovery': {'server': ''},
 }
@@ -115,6 +115,7 @@ def load_config(path=None):
         'receiver_name': c.get('receiver_name').strip() or f'{socket.gethostname()} (HNdi)',
         'nosignal': c.get('nosignal').strip() or 'black',
         'api_port': int(c.get('api_port') or 8791),
+        'api_bind': (c.get('api_bind') or '127.0.0.1').strip() or '127.0.0.1',
         'discovery_server': cfg['discovery'].get('server').strip(),
     }
     if conf['bandwidth'] not in ('highest', 'lowest', 'auto'):
@@ -678,12 +679,15 @@ def make_handler(node):
     return H
 
 
-def serve_api(node, port):
-    srv = ThreadingHTTPServer(('127.0.0.1', port), make_handler(node))
+def serve_api(node, port, bind='127.0.0.1'):
+    # bind 0.0.0.0 (hndi.conf api_bind) lets a Régie served from another box — casa, the show
+    # master — poll /sources on this mini. Read-only listing is harmless; the source switch
+    # (POST /source) stays LAN-reachable too, so only do this on a show LAN you control.
+    srv = ThreadingHTTPServer((bind, port), make_handler(node))
     srv.daemon_threads = True
     t = threading.Thread(target=srv.serve_forever, name='api', daemon=True)
     t.start()
-    log.info('API on http://127.0.0.1:%d', port)
+    log.info('API on http://%s:%d', bind, port)
     return srv
 
 
@@ -713,7 +717,7 @@ def main():
     node.start()
     if a.dry_run:
         return
-    serve_api(node, conf['api_port'])
+    serve_api(node, conf['api_port'], conf.get('api_bind', '127.0.0.1'))
     for s in (signal.SIGINT, signal.SIGTERM):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, s, lambda *_: (node.stop(), False)[1])
     try:

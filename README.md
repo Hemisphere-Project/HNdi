@@ -95,7 +95,7 @@ hndi in restart                   # systemctl restart hndi-in
 hndi in log                       # journalctl -fu hndi-in
 ```
 
-## Local API — `http://127.0.0.1:8791`
+## Local API — `http://127.0.0.1:8791` (`api_bind = 0.0.0.0` in hndi.conf makes it LAN-visible: the show fleet's Régie, served from casa, polls `/sources` on the minis)
 
 Loopback only, CORS `*`, no auth. An `https://` page may `fetch` it (localhost is exempt
 from mixed-content blocking).
