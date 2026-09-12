@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# verify — HNdi's green light. Run it from anywhere; it works on the repo root.
+#
+#     scripts/verify
+#
+# The 37Projects hub names this command in `projects/hndi/project.md` (`repos:` → `verify:`),
+# so `brain-code-turn verify` runs it in a worktree before anything is pushed: nothing lands on
+# a tree this script has not passed.
+#
+# WHAT IT CLAIMS, exactly — four checks, in order of what they'd catch:
+#   1. the input node's logic — source matching, /boot/hndi.conf parsing, the pipeline
+#      description strings (the intervideo seam), the bandwidth=auto policy — tests/node.py
+#   2. the local HTTP API every consumer speaks — /status, /sources, /source, /bandwidth,
+#      exercised in process against a real handler on an ephemeral port — tests/api.py
+#   3. every tracked Python file parses, and the `hndi` CLI runs
+#   4. every tracked shell script parses
+#
+# Both suites import `input/hndi-in` behind a stdlib-only stand-in for gi/GLib/Gst
+# (tests/harness.py), so they run on any machine with Python 3 — no GStreamer, no NDI
+# runtime, no v4l2loopback, no device, no network beyond loopback. ~1 s.
+#
+# WHAT IT DOES NOT CLAIM — read this before trusting a green:
+#   * NOT the GStreamer pipelines. The tests assert what the daemon *describes*; only a box
+#     with gst-plugin-ndi and /dev/video10 can prove the description plays. A wrong element
+#     name, a caps mismatch the tests do not name, or anything `hndi-in --dry-run` would
+#     reveal, passes this script. The harness makes every `Gst.*` access raise, on purpose.
+#   * NOT the runtime install — install.sh, lib/install-*.sh, the NDI SDK fetch, the plugin
+#     build (.github/workflows/gst-ndi.yml), v4l2loopback, the systemd unit. Check 4 proves
+#     those scripts parse, nothing more. They are proven by installing a box.
+#   * NOT the browser end. getUserMedia on a kiosked page is hndi#t-002 / hkiosk#t-001, and
+#     needs Chrome on a real device.
+#   * NOT latency, NOT a real NDI sender, NOT bench/ — those are field measurements.
+#
+# Adding a check is welcome; adding one to the list above without adding it here is not.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+fail() { echo "verify: FAILED — $*" >&2; exit 1; }
+step() { echo; echo "=== $* ==="; }
+
+command -v python3 >/dev/null || fail "no python3 — HNdi is a Python daemon"
+
+# ---------------------------------------------------------------- 1. the input node's logic
+step "1/4 input node logic (tests/node.py)"
+python3 tests/node.py || fail "tests/node.py"
+
+# ---------------------------------------------------------------- 2. the local API contract
+# The API is the component's interface: players and the control room read signal presence
+# from it and never infer it from frames. A renamed key here is a show-night crash.
+step "2/4 local API contract (tests/api.py)"
+python3 tests/api.py || fail "tests/api.py"
+
+# ---------------------------------------------------------------- 3. python syntax floor
+# The two entry points carry no .py extension, so classify by shebang as well as by suffix —
+# `git ls-files '*.py'` alone would check bench/cdp.py and miss the whole daemon.
+step "3/4 python syntax floor"
+pyfiles=(); shfiles=()
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  case "$f" in
+    *.py) pyfiles+=("$f"); continue ;;
+    *.sh) shfiles+=("$f"); continue ;;
+  esac
+  IFS= read -r shebang < "$f" || true
+  case "$shebang" in
+    '#!'*python*) pyfiles+=("$f") ;;
+    '#!'*bash*|'#!'*/sh) shfiles+=("$f") ;;
+  esac
+done < <(git ls-files)
+
+[ "${#pyfiles[@]}" -gt 0 ] || fail "no python files found — is this the repo root?"
+python3 -m py_compile "${pyfiles[@]}" || fail "a python file does not parse"
+echo "ok — ${#pyfiles[@]} python file(s) parse: ${pyfiles[*]}"
+python3 hndi --help >/dev/null || fail "the hndi CLI does not run"
+echo "ok — hndi --help"
+
+# ---------------------------------------------------------------- 4. shell syntax floor
+# install.sh and lib/ run once per box, as root, on a night when nobody wants a typo.
+step "4/4 shell syntax floor"
+[ "${#shfiles[@]}" -gt 0 ] || fail "no shell scripts found — is this the repo root?"
+# One `bash -n` per file, NOT `bash -n "${shfiles[@]}"`: bash reads the first argument as the
+# script and the rest as its positional parameters, so the batch form silently checks exactly
+# one file. (Proven here: a broken install.sh passed the batch form.)
+for f in "${shfiles[@]}"; do
+  bash -n "$f" || fail "$f does not parse"
+done
+echo "ok — ${#shfiles[@]} shell script(s) parse"
+
+echo
+echo "VERIFY OK — input node logic, local API, python + shell syntax floors."
+echo "Reminder: the GStreamer pipelines, the install path and the browser end are NOT covered"
+echo "(see the head of this file)."
