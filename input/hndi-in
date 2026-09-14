@@ -25,6 +25,7 @@ import os
 import queue
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -83,6 +84,7 @@ DEFAULTS = {
         'hold_ms': '', 'stall_ms': '800', 'dead_ms': '8000', 'timeout': '2000',  # timeout = legacy alias for hold_ms
         'profile': 'lowlatency', 'jitter_ms': '',   # lowlatency (Ethernet) | robust (WiFi jitter buffer)
         'nosignal': 'black', 'api_port': '8791', 'api_bind': '127.0.0.1',   # api_bind 0.0.0.0 = LAN-visible (a Régie on another box lists our sources)
+        'size': 'fixed',   # fixed = width/height are the device caps; follow = the caps track the NDI source's frame size
     },
     'discovery': {'server': ''},
 }
@@ -116,12 +118,15 @@ def load_config(path=None):
         'nosignal': c.get('nosignal').strip() or 'black',
         'api_port': int(c.get('api_port') or 8791),
         'api_bind': (c.get('api_bind') or '127.0.0.1').strip() or '127.0.0.1',
+        'size': (c.get('size') or 'fixed').strip().lower(),
         'discovery_server': cfg['discovery'].get('server').strip(),
     }
     if conf['bandwidth'] not in ('highest', 'lowest', 'auto'):
         conf['bandwidth'] = 'highest'
     if conf['profile'] not in ('lowlatency', 'robust'):
         conf['profile'] = 'lowlatency'
+    if conf['size'] not in ('fixed', 'follow'):
+        conf['size'] = 'fixed'
     jit = c.get('jitter_ms')
     conf['jitter_ms'] = int(jit) if jit else (100 if conf['profile'] == 'robust' else 0)  # receive jitter buffer
     conf['ndi_queue'] = 8 if conf['profile'] == 'robust' else 2                            # ndisrc internal queue
@@ -184,6 +189,15 @@ class Node:
         self._resolve_id = None
         self._sse = []                # list of queue.Queue
         self.dry_run = dry_run
+        # size=follow: the loopback caps track the NDI source's frame size — but only when
+        # nothing reads the device. A reader (mpv on a cue) keeps the caps it opened; the
+        # new size waits in pending_size and is adopted when the last reader closes.
+        self.follow = (conf['size'] == 'follow')
+        self.source_size = None       # (w, h) seen on the NDI branch, before scaling
+        self.pending_size = None      # (w, h) to adopt once /dev/videoN has no reader
+        self.out_frames = 0           # frames written to the device by the current output pipeline
+        self._pending_logged = False
+        self._retry_id = None
 
     # persisted override ------------------------------------------------
     def _load_override(self):
@@ -234,11 +248,20 @@ class Node:
     def out_desc(self):
         c = self.conf
         fps = c['fps'] or 60
+        # intervideosrc takes the channel's caps as they come (a size=follow swap leaves one
+        # frame of the previous size in the channel): scale/convert sit in front of the fixed
+        # caps so a transient mismatch is resized instead of failing negotiation — passthrough
+        # (no copy) whenever the sizes already agree, which is always after the first frame.
         return (f'intervideosrc channel={CHANNEL} timeout={c["hold_ms"] * 1000000} '
+                f'! videoscale ! videoconvert '
                 f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]},framerate={fps}/1 '
                 f'! {self.caps_shim()} '
                 f'! queue max-size-buffers=2 leaky=downstream '
                 f'! v4l2sink name=v4l2 device=/dev/video{c["device"]} sync=true')   # sync=true: the sink paces intervideosrc at the caps framerate
+
+    def in_caps(self):
+        c = self.conf
+        return f'video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]},pixel-aspect-ratio=1/1'
 
     def in_desc(self, src):
         c = self.conf
@@ -257,8 +280,9 @@ class Node:
         return (f'ndisrc {sel} receiver-ndi-name="{c["receiver_name"]}" bandwidth={bw} '
                 f'timeout={c["dead_ms"] + 5000} connect-timeout=10000 max-queue-length={c["ndi_queue"]} color-format=uyvy-bgra '
                 f'! ndisrcdemux name=d d.video ! {vq} '
-                f'! videoconvert n-threads=4 ! videoscale '
-                f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]} '
+                f'! identity name=srcsize silent=true '        # size=follow: the CAPS event here carries the source's frame size
+                f'! videoconvert n-threads=4 ! videoscale add-borders=true '
+                f'! capsfilter name=incaps caps={self.in_caps()} '   # PAR 1/1 → a mismatched source is letterboxed, never stretched; swapped in place by size=follow
                 f'{rate}! {self.caps_shim()} '      # same tags as the output side → intervideosrc passes frames through untouched
                 f'! intervideosink name=ivsink channel={CHANNEL} sync=false')
 
@@ -267,13 +291,16 @@ class Node:
             print('output:', self.out_desc())
             print('input :', self.in_desc({'name': self.wanted_source() or '<first source found>'}))
             return
-        self.out_pipe = Gst.parse_launch(self.out_desc())
-        bus = self.out_pipe.get_bus()
-        bus.add_signal_watch()
-        bus.connect('message::error', self._on_out_error)
-        if self.out_pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+        if self.follow:
+            # restarted while a reader holds the device (a cue on air): the loopback keeps the
+            # reader's format, so open at that size — the source size is adopted at the next cue
+            held = self.device_readers()
+            cur = self.device_format() if held else None
+            if cur and cur != (self.conf['width'], self.conf['height']):
+                log.info('device held by pid %s at %dx%d — starting at that size', ','.join(map(str, held)), *cur)
+                self.conf['width'], self.conf['height'] = cur
+        if not self._build_output():
             raise SystemExit('output pipeline failed to start (is /dev/video%d a v4l2loopback device?)' % self.conf['device'])
-        log.info('output pipeline up: /dev/video%d %s %dx%d', self.conf['device'], self.conf['format'], self.conf['width'], self.conf['height'])
         self.monitor = Gst.DeviceMonitor()
         self.monitor.add_filter('Source/Network', Gst.Caps.from_string('application/x-ndi'))
         self.monitor.start()
@@ -342,6 +369,27 @@ class Node:
                 return s
         return None
 
+    def _build_output(self):
+        """(Re)build the persistent loopback writer at the current conf size."""
+        if self.out_pipe:
+            self.out_pipe.set_state(Gst.State.NULL)
+            self.out_pipe = None
+        self.out_frames = 0           # v4l2loopback is capture-ready only once the writer streamed a frame
+        self.out_pipe = Gst.parse_launch(self.out_desc())
+        bus = self.out_pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self._on_out_error)
+        self.out_pipe.get_by_name('v4l2').get_static_pad('sink').add_probe(
+            Gst.PadProbeType.BUFFER, self._on_out_frame, None)
+        if self.out_pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            return False
+        log.info('output pipeline up: /dev/video%d %s %dx%d', self.conf['device'], self.conf['format'], self.conf['width'], self.conf['height'])
+        return True
+
+    def _on_out_frame(self, pad, info, _):
+        self.out_frames += 1
+        return Gst.PadProbeReturn.OK
+
     def _resolve_tick(self):
         if self.state not in ('resolving', 'retrying'):
             return True
@@ -371,8 +419,11 @@ class Node:
         bus.connect('message::eos', self._on_in_eos)
         sink = self.in_pipe.get_by_name('ivsink')
         sink.get_static_pad('sink').add_probe(Gst.PadProbeType.BUFFER, self._on_frame, None)
+        self.in_pipe.get_by_name('srcsize').get_static_pad('sink').add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_src_event, None)
         self.resolved = src
         self.last_frame_t = None
+        self.source_size = None       # unknown until this branch's CAPS event
         self._set_state('connecting')
         if self.in_pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             log.error('input pipeline refused to start')
@@ -423,6 +474,123 @@ class Node:
             GLib.idle_add(self._set_state, 'running')
         return Gst.PadProbeReturn.OK
 
+    # size=follow ------------------------------------------------------
+    def _on_src_event(self, pad, info, _):
+        ev = info.get_event()
+        if ev and ev.type == Gst.EventType.CAPS:
+            st = ev.parse_caps().get_structure(0)
+            ok_w, w = st.get_int('width'); ok_h, h = st.get_int('height')
+            if ok_w and ok_h and (w, h) != self.source_size:
+                self.source_size = (w, h)
+                log.info('source frame size %dx%d', w, h)
+                GLib.idle_add(self._on_source_size, w, h)
+        return Gst.PadProbeReturn.OK
+
+    def _on_source_size(self, w, h):
+        if not self.follow:
+            return False
+        c = self.conf
+        if (w, h) == (c['width'], c['height']):
+            self.pending_size = None
+            return False
+        self.pending_size = (w, h)
+        self._pending_logged = False
+        self._apply_pending_size()
+        return False
+
+    def size_settled(self):
+        """True when the device caps are the right ones for the source on air: fixed mode
+        always; follow mode once the current branch reported its frame size and it matches.
+        A player asking PUT /source with a wait gets its answer when this turns True."""
+        if not self.follow:
+            return True
+        return self.source_size is not None and self.pending_size is None and self.out_frames > 0
+
+    def device_readers(self):
+        """PIDs pinning /dev/videoN, ours excluded (mpv on a cue, Chrome on a kiosk): an open
+        fd, or a mapping — mpv keeps its mmap'ed capture buffers after closing the fd while a
+        DQBUF is stuck (writer gone), and a mapping alone keeps v4l2loopback's open_count up."""
+        dev = f'/dev/video{self.conf["device"]}'
+        me = os.getpid(); pids = []
+        for p in os.listdir('/proc'):
+            if not p.isdigit() or int(p) == me:
+                continue
+            try:
+                hit = any(os.readlink(f'/proc/{p}/fd/{fd}') == dev for fd in os.listdir(f'/proc/{p}/fd'))
+                if not hit:
+                    with open(f'/proc/{p}/maps') as f:
+                        hit = any(line.rstrip().endswith(dev) for line in f)
+                if hit:
+                    pids.append(int(p))
+            except OSError:
+                continue
+        return pids
+
+    def device_format(self):
+        """(w, h) the loopback is pinned to, or None. A reader keeps the writer's format alive
+        after the writer is gone (v4l2loopback 0.15: sysfs `format` = "YUYV:512x512@60"; the
+        capture-side G_FMT answers EINVAL then, the output side still knows)."""
+        n = self.conf['device']
+        try:
+            with open(f'/sys/devices/virtual/video4linux/video{n}/format') as f:
+                m = re.search(r':(\d+)x(\d+)@', f.read())
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+        except OSError:
+            pass
+        try:
+            out = subprocess.run(['v4l2-ctl', '-d', f'/dev/video{n}', '--get-fmt-video-out'],
+                                 capture_output=True, text=True, timeout=3).stdout
+            m = re.search(r'Width/Height\s*:\s*(\d+)/(\d+)', out)
+            return (int(m.group(1)), int(m.group(2))) if m else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _retry_pending_size(self):
+        self._retry_id = None
+        self._apply_pending_size()
+        return False
+
+    def _apply_pending_size(self):
+        """Adopt pending_size as the loopback caps — only when no reader holds the device.
+        Rebuilds the output pipeline (new caps on v4l2sink) and the input branch (its
+        caps filter), then reconnects the same source; a reader keeps what it opened."""
+        if not self.pending_size or self.dry_run:
+            return
+        readers = self.device_readers()
+        if readers:
+            if not self._pending_logged:
+                log.info('source is %dx%d, device caps stay %dx%d while pid %s reads it — adopting when it closes',
+                         *self.pending_size, self.conf['width'], self.conf['height'], ','.join(map(str, readers)))
+                self._pending_logged = True
+            if not self._retry_id:   # a player closing the device for a cue change frees it within ms: look again soon
+                self._retry_id = GLib.timeout_add(150, self._retry_pending_size)
+            return
+        w, h = self.pending_size
+        log.info('adopting source size %dx%d as the device caps (was %dx%d)', w, h, self.conf['width'], self.conf['height'])
+        self._stop_slate()
+        self.conf['width'], self.conf['height'] = w, h
+        self.pending_size = None
+        inplace = self.in_pipe is not None and self.source_size == (w, h)
+        if inplace:
+            # the branch reporting this size stays connected: its caps filter takes the new
+            # size and the scaler renegotiates on the next frame — no NDI reconnect (2.7 s
+            # against a busy sender, kmini-007 2026-09-14), no black
+            self.in_pipe.get_by_name('incaps').set_property('caps', Gst.Caps.from_string(self.in_caps()))
+        else:
+            self.source_size = None   # settled only once a fresh branch reports its size
+            self._stop_input()
+        if not self._build_output():
+            log.error('output pipeline failed to restart at %dx%d — exiting so systemd restarts us', w, h)
+            self.stop(); return
+        self.restarts += 1
+        if not inplace:
+            if self.resolved:
+                self._start_input(self.resolved)
+            else:
+                self._set_state('resolving')
+        self._push_sse()
+
     def _on_in_error(self, bus, msg):
         err, dbg = msg.parse_error()
         log.warning('input error: %s (%s)', err.message, (dbg or '').splitlines()[0] if dbg else '')
@@ -463,6 +631,8 @@ class Node:
                 self._start_slate()      # connecting but no frames yet → show the slate, not black
         if self.auto:
             self._auto_bandwidth()
+        if self.pending_size:
+            self._apply_pending_size()
         self._push_sse(heartbeat=True)
         return True
 
@@ -514,6 +684,10 @@ class Node:
                        'resolved': self.resolved['name'] if self.resolved else '',
                        'url': (self.resolved or {}).get('url', '')},
             'receiver': c['receiver_name'], 'width': c['width'], 'height': c['height'],
+            'size': c['size'], 'source_size': list(self.source_size) if self.source_size else None,
+            'pending_size': list(self.pending_size) if self.pending_size else None,
+            'settled': self.size_settled(), 'out_frames': self.out_frames,
+            'readers': self.device_readers() if self.follow else [],
             'fps': c['fps'] or None, 'fps_measured': self.fps_measured, 'format': c['format'],
             'device': f'/dev/video{c["device"]}', 'bandwidth': self.bandwidth,
             'mode': self.mode, 'auto': self.auto, 'profile': c['profile'],
@@ -535,6 +709,7 @@ class Node:
         # cue re-naming what is playing must not blank the wall for a reconnect
         if self.state == 'running' and self.resolved and name and self._match(name, [self.resolved]):
             log.info('source %r already on air as %r — no restart', name, self.resolved['name'])
+            self._apply_pending_size()   # a cue re-selecting the source is the moment its reader has closed the device
             return False
         self.restarts += 1
         self._stop_input()
@@ -641,7 +816,26 @@ def make_handler(node):
                 if not isinstance(b.get('name', ''), str):
                     return self._json(400, {'error': 'name must be a string'})
                 GLib.idle_add(node.set_source, b.get('name', ''), bool(b.get('persist')))
-                return self._json(202, {'ok': True, 'name': b.get('name', ''), 'persist': bool(b.get('persist'))})
+                # wait=<s>: block until the device caps are settled for the new source (size=follow
+                # rebuilds them once the previous reader — the player between two cues — has closed
+                # the device), so the caller opens /dev/videoN with the right caps. Bounded.
+                try:
+                    wait = min(float(b.get('wait') or 0), 15.0)
+                except (TypeError, ValueError):
+                    wait = 0.0
+                settled = node.size_settled()
+                if wait > 0:
+                    deadline = time.monotonic() + wait
+                    time.sleep(0.05)                 # let set_source run on the GLib thread first
+                    while time.monotonic() < deadline:
+                        settled = node.size_settled()
+                        if settled:
+                            break
+                        time.sleep(0.05)
+                return self._json(202 if not wait else (200 if settled else 202),
+                                  {'ok': True, 'name': b.get('name', ''), 'persist': bool(b.get('persist')),
+                                   'settled': settled, 'width': node.conf['width'], 'height': node.conf['height'],
+                                   'source_size': list(node.source_size) if node.source_size else None})
             if self.path == '/bandwidth':
                 if b.get('mode') not in ('highest', 'lowest', 'auto'):
                     return self._json(400, {'error': 'mode must be highest|lowest|auto'})

@@ -66,6 +66,7 @@ source =              # exact NDI name "MACHINE (source)"; blank = first found.
                       #   also: ndi://ip:port or ip:port for a direct connect (no discovery)
 width = 1920          # V4L2 device size, stable for the browser. Prefer the LED-native size.
 height = 1080
+size = fixed          # fixed | follow — see "Following the source size" below
 fps =                 # blank = passthrough; e.g. 60 inserts videorate
 format = YUY2         # what Chrome accepts from V4L2 (UYVY is NOT enumerated by Chrome)
 device = 10           # /dev/video10, card_label=NDI
@@ -104,10 +105,32 @@ from mixed-content blocking).
 |---|---|
 | `GET /status` | state, resolved source, size/format/fps, `fps_measured`, `frames`, `restarts`, `last_frame_age_ms`, `uptime_s` |
 | `GET /sources` | `[{name, url}]` seen on the LAN (cached ≤ 10 s) |
-| `PUT /source` | `{"name":"…","persist":false}` — restart the input on a new source |
+| `PUT /source` | `{"name":"…","persist":false,"wait":4}` — restart the input on a new source; `wait` (s, ≤ 15) answers only once the device caps are settled for it (`size = follow`), `200` settled / `202` not yet |
 | `DELETE /source` | drop the override, back to `hndi.conf` |
 | `PUT /bandwidth` | `{"mode":"highest\|lowest\|auto"}` |
 | `GET /events` | Server-Sent Events: a `status` event on every state change |
+
+## Following the source size (`size = follow`)
+
+A wall fed by a media player (HPlayer2 + mpv on the kmini fleet) wants the loopback at the
+source's own frame size, not a fixed 1080p: a 256x512 LED feed must reach mpv as 256x512.
+With `size = follow` the daemon reads the frame size on the NDI branch (a `CAPS` event on the
+`srcsize` identity) and rebuilds the output pipeline with it. One rule the kernel imposes:
+**v4l2loopback keeps the format as long as anyone holds the device** (`try_free_buffers`
+resets it only at `open_count == 0`), so the caps can only change while no reader is open.
+Hence:
+
+- a source switch is the moment to do it: HPlayer2 sends mpv `stop` first, then
+  `PUT /source {"name": …, "wait": 4}` — the call returns when the caps match the new
+  source (`settled: true`) and only then does mpv open `/dev/video10`;
+- a source that changes size mid-stream while a reader holds the device is **letterboxed**
+  into the current caps (`videoscale add-borders` + square pixels — never stretched); the new
+  size is `pending_size` in `/status` and is adopted the instant the reader closes (the
+  daemon polls readers every 150 ms while pending);
+- `readers` in `/status` lists the PIDs holding the device; `settled` says whether the caps
+  match the source on air.
+
+`size = fixed` (default) is the browser behaviour: the caps never move, Chrome keeps its camera.
 
 ## Troubleshooting
 
