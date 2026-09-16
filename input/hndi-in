@@ -87,7 +87,7 @@ DEFAULTS = {
         'size': 'fixed',   # fixed = width/height are the device caps; follow = the caps track the NDI source's frame size
         'autopick': 'true',   # false = never connect to "the first source found": no source until a cue (PUT /source) names one
     },
-    'discovery': {'server': ''},
+    'discovery': {'server': '', 'ips': ''},
 }
 
 
@@ -122,6 +122,7 @@ def load_config(path=None):
         'size': (c.get('size') or 'fixed').strip().lower(),
         'autopick': (c.get('autopick') or 'true').strip().lower() not in ('0', 'false', 'no', 'off'),
         'discovery_server': cfg['discovery'].get('server').strip(),
+        'discovery_ips': ','.join(x.strip() for x in cfg['discovery'].get('ips', '').split(',') if x.strip()),
     }
     if conf['bandwidth'] not in ('highest', 'lowest', 'auto'):
         conf['bandwidth'] = 'highest'
@@ -151,7 +152,10 @@ def write_ndi_config(conf, sdir):
     d = os.path.join(sdir, 'ndi')
     os.makedirs(d, exist_ok=True)
     p = os.path.join(d, 'ndi-config.v1.json')
-    doc = {'ndi': {'networks': {'discovery': conf['discovery_server'], 'ips': ''},
+    # ips: senders the finder asks DIRECTLY (unicast, their TCP 5960) — every source on those
+    # machines is listed whether or not their mDNS announcements reach this box (the show
+    # switch delivered them unevenly on 2026-09-16: casa saw two of four, a mini one)
+    doc = {'ndi': {'networks': {'discovery': conf['discovery_server'], 'ips': conf['discovery_ips']},
                    'rudp': {'send': {'enable': True}, 'recv': {'enable': True}}}}
     try:
         with open(p, 'w') as f:
@@ -344,11 +348,12 @@ class Node:
         # is a '-' event on the continuous browse — so a name avahi has withdrawn (and not
         # seen since) is dropped. Names avahi merely has not mentioned stay: mDNS delivery
         # is flaky per box, the provider's memory is what papers over that.
-        gone = self._avahi_gone
-        out = [e for e in out if not (e['name'] in gone and gone[e['name']] > self._avahi_seen.get(e['name'], 0.0))]
+        gone = {n for n, t in self._avahi_gone.items() if t > self._avahi_seen.get(n, 0.0)}
         # and a sender gone without a goodbye keeps its record for the mDNS TTL (up to 75 min):
-        # the liveness thread knocks on each ip:port, three misses in a row hide the entry
-        out = [e for e in out if self._dead.get(e['name'], 0) < 3]
+        # the liveness thread knocks on each ip:port, three misses in a row hide the entry; a
+        # withdrawn name is hidden at the first miss — and kept while its port still answers,
+        # because a withdrawal on a flaky-multicast LAN says nothing about the sender
+        out = [e for e in out if self._dead.get(e['name'], 0) < (1 if e['name'] in gone else 3)]
         self._sources_cache = (out, time.monotonic())
         return out
 
@@ -400,7 +405,13 @@ class Node:
 
     @staticmethod
     def _avahi_unescape(s):
-        return re.sub(r'\\(\d{3})', lambda m: chr(int(m.group(1))), s)
+        """avahi -p escapes bytes as \\NNN (decimal): rebuild the bytes, then decode UTF-8 — an
+        accented NDI name ('Arena - 2x Scène') must match the provider's name byte for byte."""
+        raw = re.sub(r'\\(\d{3})', lambda m: bytes([int(m.group(1))]).decode('latin-1'), s)
+        try:
+            return raw.encode('latin-1').decode('utf-8')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return raw
 
     def _avahi_watch(self):
         """Thread: a continuous `avahi-browse _ndi._tcp`; '+' marks a name seen, '-' a name
