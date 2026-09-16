@@ -201,6 +201,7 @@ class Node:
         self._fail_streak = 0         # consecutive failed connects (a stale address is re-resolved through mDNS)
         self._avahi_seen = {}         # name → monotonic time of the last '+' on the avahi browse
         self._avahi_gone = {}         # name → monotonic time of the last '-' (withdrawn)
+        self._dead = {}               # name → consecutive TCP knocks unanswered (≥ 3 hides the entry)
         self._out_retry_t = 0.0       # last writer rebuild attempted from an output error
         self._pending_logged = False
         self._retry_id = None
@@ -311,6 +312,7 @@ class Node:
         self.monitor.add_filter('Source/Network', Gst.Caps.from_string('application/x-ndi'))
         self.monitor.start()
         threading.Thread(target=self._avahi_watch, daemon=True, name='avahi').start()
+        threading.Thread(target=self._liveness_watch, daemon=True, name='liveness').start()
         self._set_state('resolving')
         self._resolve_id = GLib.timeout_add_seconds(RESOLVE_INTERVAL_S, self._resolve_tick)
         GLib.timeout_add(1000, self._second_tick)
@@ -336,6 +338,22 @@ class Node:
         lst, t = self._sources_cache
         if time.monotonic() - t < max_age and lst:
             return lst
+        out = self._raw_sources()
+        # the provider also never forgets: a sender that quit (or a laptop that left) stays
+        # listed for the life of the daemon. avahi does forget — a goodbye or a TTL expiry
+        # is a '-' event on the continuous browse — so a name avahi has withdrawn (and not
+        # seen since) is dropped. Names avahi merely has not mentioned stay: mDNS delivery
+        # is flaky per box, the provider's memory is what papers over that.
+        gone = self._avahi_gone
+        out = [e for e in out if not (e['name'] in gone and gone[e['name']] > self._avahi_seen.get(e['name'], 0.0))]
+        # and a sender gone without a goodbye keeps its record for the mDNS TTL (up to 75 min):
+        # the liveness thread knocks on each ip:port, three misses in a row hide the entry
+        out = [e for e in out if self._dead.get(e['name'], 0) < 3]
+        self._sources_cache = (out, time.monotonic())
+        return out
+
+    def _raw_sources(self):
+        """The device provider's list, newest entry per name."""
         out, by_name = [], {}
         if self.monitor:
             for d in self.monitor.get_devices():
@@ -351,15 +369,34 @@ class Node:
                 else:
                     by_name[name] = len(out)
                     out.append(entry)
-        # the provider also never forgets: a sender that quit (or a laptop that left) stays
-        # listed for the life of the daemon. avahi does forget — a goodbye or a TTL expiry
-        # is a '-' event on the continuous browse — so a name avahi has withdrawn (and not
-        # seen since) is dropped. Names avahi merely has not mentioned stay: mDNS delivery
-        # is flaky per box, the provider's memory is what papers over that.
-        gone = self._avahi_gone
-        out = [e for e in out if not (e['name'] in gone and gone[e['name']] > self._avahi_seen.get(e['name'], 0.0))]
-        self._sources_cache = (out, time.monotonic())
         return out
+
+    def _liveness_watch(self):
+        """Thread: every 20 s a TCP knock on each listed sender's ip:port (an NDI sender
+        listens there). A laptop unplugged or re-addressed answers nothing at once, while its
+        mDNS record lingers until the TTL runs out; three misses in a row hide it, one answer
+        brings it back."""
+        while True:
+            time.sleep(20)
+            try:
+                for e in self._raw_sources():
+                    url = e.get('url') or ''
+                    if ':' not in url:
+                        continue
+                    host, port = url.rsplit(':', 1)
+                    try:
+                        socket.create_connection((host, int(port)), timeout=1.5).close()
+                        if self._dead.pop(e['name'], 0) >= 3:
+                            log.info('%s answers again at %s', e['name'], url)
+                            self._sources_cache = ([], 0.0)
+                    except OSError:
+                        n = self._dead.get(e['name'], 0) + 1
+                        self._dead[e['name']] = n
+                        if n == 3:
+                            log.info('%s does not answer at %s — hidden until it does', e['name'], url)
+                            self._sources_cache = ([], 0.0)
+            except Exception as ex:  # noqa: BLE001 — never let the watcher die
+                log.warning('liveness watch: %s', ex)
 
     @staticmethod
     def _avahi_unescape(s):
