@@ -196,6 +196,10 @@ class Node:
         self.source_size = None       # (w, h) seen on the NDI branch, before scaling
         self.pending_size = None      # (w, h) to adopt once /dev/videoN has no reader
         self.out_frames = 0           # frames written to the device by the current output pipeline
+        self._fail_streak = 0         # consecutive failed connects (a stale address is re-resolved through mDNS)
+        self._avahi_seen = {}         # name → monotonic time of the last '+' on the avahi browse
+        self._avahi_gone = {}         # name → monotonic time of the last '-' (withdrawn)
+        self._out_retry_t = 0.0       # last writer rebuild attempted from an output error
         self._pending_logged = False
         self._retry_id = None
 
@@ -304,6 +308,7 @@ class Node:
         self.monitor = Gst.DeviceMonitor()
         self.monitor.add_filter('Source/Network', Gst.Caps.from_string('application/x-ndi'))
         self.monitor.start()
+        threading.Thread(target=self._avahi_watch, daemon=True, name='avahi').start()
         self._set_state('resolving')
         self._resolve_id = GLib.timeout_add_seconds(RESOLVE_INTERVAL_S, self._resolve_tick)
         GLib.timeout_add(1000, self._second_tick)
@@ -329,15 +334,70 @@ class Node:
         lst, t = self._sources_cache
         if time.monotonic() - t < max_age and lst:
             return lst
-        out = []
+        out, by_name = [], {}
         if self.monitor:
             for d in self.monitor.get_devices():
                 props = d.get_properties()
                 name = (props.get_string('ndi-name') if props and props.has_field('ndi-name') else None) or d.get_display_name()
                 url = props.get_string('url-address') if props and props.has_field('url-address') else ''
-                out.append({'name': name, 'url': url or ''})
+                entry = {'name': name, 'url': url or ''}
+                # the device provider only ever adds: a sender that changed address or port
+                # (a laptop re-addressed on site, a Resolume screen re-created) is listed
+                # twice, the stale entry first — keep the newest per name
+                if name in by_name:
+                    out[by_name[name]] = entry
+                else:
+                    by_name[name] = len(out)
+                    out.append(entry)
+        # the provider also never forgets: a sender that quit (or a laptop that left) stays
+        # listed for the life of the daemon. avahi does forget — a goodbye or a TTL expiry
+        # is a '-' event on the continuous browse — so a name avahi has withdrawn (and not
+        # seen since) is dropped. Names avahi merely has not mentioned stay: mDNS delivery
+        # is flaky per box, the provider's memory is what papers over that.
+        gone = self._avahi_gone
+        out = [e for e in out if not (e['name'] in gone and gone[e['name']] > self._avahi_seen.get(e['name'], 0.0))]
         self._sources_cache = (out, time.monotonic())
         return out
+
+    @staticmethod
+    def _avahi_unescape(s):
+        return re.sub(r'\\(\d{3})', lambda m: chr(int(m.group(1))), s)
+
+    def _avahi_watch(self):
+        """Thread: a continuous `avahi-browse _ndi._tcp`; '+' marks a name seen, '-' a name
+        withdrawn (sender goodbye, TTL). Restarted if it dies; silent when avahi is absent."""
+        while True:
+            try:
+                proc = subprocess.Popen(['avahi-browse', '-p', '_ndi._tcp'], stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True)
+                for line in proc.stdout:
+                    f = line.rstrip('\n').split(';')
+                    if len(f) < 4 or f[0] not in ('+', '-'):
+                        continue
+                    name = self._avahi_unescape(f[3])
+                    if f[0] == '+':
+                        self._avahi_seen[name] = time.monotonic()
+                    else:
+                        self._avahi_gone[name] = time.monotonic()
+                        log.info('mDNS withdrew %s', name)
+                    self._sources_cache = ([], 0.0)
+                proc.wait()
+            except (OSError, subprocess.SubprocessError) as e:
+                log.warning('avahi browse unavailable: %s', e)
+                return
+            time.sleep(5)
+
+    def _avahi_resolve(self, name):
+        """Fresh ip:port for an NDI source name from an mDNS resolve (a few seconds), or ''."""
+        try:
+            out = subprocess.run(['avahi-browse', '-rpt', '_ndi._tcp'], capture_output=True, text=True, timeout=12).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ''
+        for line in out.splitlines():
+            f = line.split(';')
+            if len(f) >= 9 and f[0] == '=' and self._avahi_unescape(f[3]) == name and f[2] == 'IPv4':
+                return f'{f[7]}:{f[8]}'
+        return ''
 
     def _pick(self):
         want = self.wanted_source()
@@ -346,9 +406,15 @@ class Node:
         if want and ':' in want and want.replace('.', '').replace(':', '').isdigit():
             return {'name': want, 'url': want}       # bare ip:port → direct, no discovery
         srcs = self.sources(max_age=0)
-        if want:
-            return self._match(want, srcs)
-        return srcs[0] if srcs else None
+        src = self._match(want, srcs) if want else (srcs[0] if srcs else None)
+        if src and self._fail_streak and src.get('url'):
+            # the connect just failed: the provider may hold the address the sender had
+            # before it moved (a laptop re-addressed on site) — ask mDNS for the current one
+            fresh = self._avahi_resolve(src['name'])
+            if fresh and fresh != src['url']:
+                log.info('%s moved: %s → %s (mDNS)', src['name'], src['url'], fresh)
+                src = dict(src, url=fresh)
+        return src
 
     @staticmethod
     def _match(want, srcs):
@@ -463,6 +529,7 @@ class Node:
     def _schedule_retry(self):
         self._stop_input()
         self.restarts += 1
+        self._fail_streak += 1
         self._set_state('retrying')
 
     def _on_frame(self, pad, info, _):
@@ -471,6 +538,7 @@ class Node:
         self.last_frame_t = time.monotonic()
         self.stalled = False
         if self.state == 'connecting':
+            self._fail_streak = 0
             GLib.idle_add(self._set_state, 'running')
         return Gst.PadProbeReturn.OK
 
@@ -602,6 +670,12 @@ class Node:
 
     def _on_out_error(self, bus, msg):
         err, _ = msg.parse_error()
+        if time.monotonic() - self._out_retry_t > 10:
+            # a transient (seen once right after an adoption): one rebuild before giving up
+            self._out_retry_t = time.monotonic()
+            log.warning('OUTPUT pipeline error: %s — rebuilding the writer once', err.message)
+            if self._build_output():
+                return
         log.error('OUTPUT pipeline error: %s — exiting so systemd restarts us', err.message)
         self.stop()
 
