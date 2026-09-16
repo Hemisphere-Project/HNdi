@@ -85,6 +85,7 @@ DEFAULTS = {
         'profile': 'lowlatency', 'jitter_ms': '',   # lowlatency (Ethernet) | robust (WiFi jitter buffer)
         'nosignal': 'black', 'api_port': '8791', 'api_bind': '127.0.0.1',   # api_bind 0.0.0.0 = LAN-visible (a Régie on another box lists our sources)
         'size': 'fixed',   # fixed = width/height are the device caps; follow = the caps track the NDI source's frame size
+        'autopick': 'true',   # false = never connect to "the first source found": no source until a cue (PUT /source) names one
     },
     'discovery': {'server': ''},
 }
@@ -119,6 +120,7 @@ def load_config(path=None):
         'api_port': int(c.get('api_port') or 8791),
         'api_bind': (c.get('api_bind') or '127.0.0.1').strip() or '127.0.0.1',
         'size': (c.get('size') or 'fixed').strip().lower(),
+        'autopick': (c.get('autopick') or 'true').strip().lower() not in ('0', 'false', 'no', 'off'),
         'discovery_server': cfg['discovery'].get('server').strip(),
     }
     if conf['bandwidth'] not in ('highest', 'lowest', 'auto'):
@@ -405,6 +407,8 @@ class Node:
             return {'name': want, 'url': want[6:]}
         if want and ':' in want and want.replace('.', '').replace(':', '').isdigit():
             return {'name': want, 'url': want}       # bare ip:port → direct, no discovery
+        if not want and not self.conf['autopick']:
+            return None                              # a show box shows nothing until a cue names a source
         srcs = self.sources(max_age=0)
         src = self._match(want, srcs) if want else (srcs[0] if srcs else None)
         if src and self._fail_streak and src.get('url'):
@@ -514,7 +518,7 @@ class Node:
                 f'! video/x-raw,format={c["format"]},width={c["width"]},height={c["height"]},framerate={fps}/1 '
                 f'! textoverlay name=slatetxt valignment=center halignment=center font-desc="Monospace 40" shaded-background=true '
                 f'! {self.caps_shim()} ! intervideosink channel={CHANNEL} sync=false')
-            src = self.wanted_source() or 'searching for a source…'
+            src = self.wanted_source() or ('waiting for a cue' if not self.conf['autopick'] else 'searching for a source…')
             self.slate_pipe.get_by_name('slatetxt').set_property(
                 'text', f'NO NDI SIGNAL\n{socket.gethostname()}\n{src}')
             self.slate_pipe.set_state(Gst.State.PLAYING)
@@ -787,6 +791,7 @@ class Node:
             return False
         self.restarts += 1
         self._stop_input()
+        self.resolved = None          # status must not keep naming the source a cue just left
         self._set_state('resolving')
         self._resolve_tick()
         return False

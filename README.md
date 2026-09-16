@@ -67,6 +67,7 @@ source =              # exact NDI name "MACHINE (source)"; blank = first found.
 width = 1920          # V4L2 device size, stable for the browser. Prefer the LED-native size.
 height = 1080
 size = fixed          # fixed | follow — see "Following the source size" below
+autopick = true       # false = a blank source is NO source until a cue names one (show boxes)
 fps =                 # blank = passthrough; e.g. 60 inserts videorate
 format = YUY2         # what Chrome accepts from V4L2 (UYVY is NOT enumerated by Chrome)
 device = 10           # /dev/video10, card_label=NDI
