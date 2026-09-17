@@ -206,6 +206,8 @@ class Node:
         self._avahi_seen = {}         # name → monotonic time of the last '+' on the avahi browse
         self._avahi_gone = {}         # name → monotonic time of the last '-' (withdrawn)
         self._dead = {}               # name → consecutive TCP knocks unanswered (≥ 3 hides the entry)
+        self._live = {}               # name → the address the knock last found answering (overrides the provider's)
+        self._alt = {}                # name → every address the provider holds for it, newest first
         self._out_retry_t = 0.0       # last writer rebuild attempted from an output error
         self._pending_logged = False
         self._retry_id = None
@@ -358,14 +360,22 @@ class Node:
         return out
 
     def _raw_sources(self):
-        """The device provider's list, newest entry per name."""
-        out, by_name = [], {}
+        """The device provider's list, one entry per name: the address the liveness knock
+        last found answering, else the newest the provider holds. Every address seen for
+        a name is kept in _alt (newest first) — a sender on two networks (the Resolume PC
+        on the show LAN and on the NDI network, 2026-09-17) is listed once per address."""
+        out, by_name, alt = [], {}, {}
         if self.monitor:
             for d in self.monitor.get_devices():
                 props = d.get_properties()
                 name = (props.get_string('ndi-name') if props and props.has_field('ndi-name') else None) or d.get_display_name()
                 url = props.get_string('url-address') if props and props.has_field('url-address') else ''
                 entry = {'name': name, 'url': url or ''}
+                if url:
+                    alt.setdefault(name, [])
+                    if url in alt[name]:
+                        alt[name].remove(url)
+                    alt[name].insert(0, url)
                 # the device provider only ever adds: a sender that changed address or port
                 # (a laptop re-addressed on site, a Resolume screen re-created) is listed
                 # twice, the stale entry first — keep the newest per name
@@ -374,7 +384,36 @@ class Node:
                 else:
                     by_name[name] = len(out)
                     out.append(entry)
+        self._alt = alt
+        for e in out:
+            live = self._live.get(e['name'])
+            if live:
+                e['url'] = live
         return out
+
+    @staticmethod
+    def _knock(url, timeout=1.5):
+        try:
+            host, port = url.rsplit(':', 1)
+            socket.create_connection((host, int(port)), timeout=timeout).close()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _avahi_candidates(self, name):
+        """Every ip:port mDNS currently resolves for a name, on any interface (a few seconds)."""
+        try:
+            out = subprocess.run(['avahi-browse', '-rpt', '_ndi._tcp'], capture_output=True, text=True, timeout=12).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        urls = []
+        for line in out.splitlines():
+            f = line.split(';')
+            if len(f) >= 9 and f[0] == '=' and f[2] == 'IPv4' and self._avahi_unescape(f[3]) == name:
+                u = f'{f[7]}:{f[8]}'
+                if u not in urls:
+                    urls.append(u)
+        return urls
 
     def _liveness_watch(self):
         """Thread: every 20 s a TCP knock on each listed sender's ip:port (an NDI sender
@@ -385,21 +424,31 @@ class Node:
             time.sleep(20)
             try:
                 for e in self._raw_sources():
-                    url = e.get('url') or ''
+                    name, url = e['name'], e.get('url') or ''
                     if ':' not in url:
                         continue
-                    host, port = url.rsplit(':', 1)
-                    try:
-                        socket.create_connection((host, int(port)), timeout=1.5).close()
-                        if self._dead.pop(e['name'], 0) >= 3:
-                            log.info('%s answers again at %s', e['name'], url)
+                    if self._knock(url):
+                        if self._dead.pop(name, 0) >= 3:
+                            log.info('%s answers again at %s', name, url)
                             self._sources_cache = ([], 0.0)
-                    except OSError:
-                        n = self._dead.get(e['name'], 0) + 1
-                        self._dead[e['name']] = n
-                        if n == 3:
-                            log.info('%s does not answer at %s — hidden until it does', e['name'], url)
-                            self._sources_cache = ([], 0.0)
+                        continue
+                    # the address we show is dead: a sender on two networks (or one that moved)
+                    # may answer on another one it announced — the provider's other entries
+                    # first, then whatever mDNS resolves for the name on any interface
+                    others = [u for u in self._alt.get(name, []) if u != url]
+                    others += [u for u in self._avahi_candidates(name) if u != url and u not in others]
+                    switched = next((u for u in others if self._knock(u)), None)
+                    if switched:
+                        log.info('%s: %s does not answer, %s does — switching', name, url, switched)
+                        self._live[name] = switched
+                        self._dead.pop(name, None)
+                        self._sources_cache = ([], 0.0)
+                        continue
+                    n = self._dead.get(name, 0) + 1
+                    self._dead[name] = n
+                    if n == 3:
+                        log.info('%s does not answer at %s (nor elsewhere) — hidden until it does', name, url)
+                        self._sources_cache = ([], 0.0)
             except Exception as ex:  # noqa: BLE001 — never let the watcher die
                 log.warning('liveness watch: %s', ex)
 
