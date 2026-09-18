@@ -22,8 +22,11 @@ BOOT="$(boot_dir)"; echo "   boot partition: $BOOT"
 say "apt dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+# v4l2loopback: the dkms package only when the kernel does not ship the module — kernel 7.0
+# carries it in-tree (0.15.3 on kxkm-ai2, 2026-09-18) and the 0.12.7 dkms package no longer builds
+V4L2LB=v4l2loopback-dkms; modinfo v4l2loopback >/dev/null 2>&1 && { V4L2LB=""; ok "v4l2loopback $(modinfo -F version v4l2loopback) already in the kernel tree — no dkms package"; }
 apt-get install -y -qq gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-base-apps \
-  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev v4l2loopback-dkms "linux-headers-$(uname -r)" v4l-utils \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev $V4L2LB "linux-headers-$(uname -r)" v4l-utils \
   python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 git curl build-essential pkg-config libssl-dev avahi-daemon \
   || { bad "apt"; exit 1; }
 ok "GStreamer $(gst_minor)"
