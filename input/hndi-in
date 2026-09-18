@@ -103,6 +103,7 @@ DEFAULTS = {
         'nosignal': 'black', 'api_port': '8791', 'api_bind': '127.0.0.1',   # api_bind 0.0.0.0 = LAN-visible (a Régie on another box lists our sources)
         'size': 'fixed',   # fixed = width/height are the device caps; follow = the caps track the NDI source's frame size
         'autopick': 'true',   # false = never connect to "the first source found": no source until a cue (PUT /source) names one
+        'rudp': 'true',       # NDI reliable-UDP transport (default); false = plain TCP — worth a try on a lossy wireless hop
     },
     'discovery': {'server': '', 'ips': ''},
 }
@@ -138,6 +139,7 @@ def load_config(path=None):
         'api_bind': (c.get('api_bind') or '127.0.0.1').strip() or '127.0.0.1',
         'size': (c.get('size') or 'fixed').strip().lower(),
         'autopick': (c.get('autopick') or 'true').strip().lower() not in ('0', 'false', 'no', 'off'),
+        'rudp': (c.get('rudp') or 'true').strip().lower() not in ('0', 'false', 'no', 'off'),
         'discovery_server': cfg['discovery'].get('server').strip(),
         'discovery_ips': ','.join(x.strip() for x in cfg['discovery'].get('ips', '').split(',') if x.strip()),
     }
@@ -173,7 +175,7 @@ def write_ndi_config(conf, sdir):
     # machines is listed whether or not their mDNS announcements reach this box (the show
     # switch delivered them unevenly on 2026-09-16: casa saw two of four, a mini one)
     doc = {'ndi': {'networks': {'discovery': conf['discovery_server'], 'ips': conf['discovery_ips']},
-                   'rudp': {'send': {'enable': True}, 'recv': {'enable': True}}}}
+                   'rudp': {'send': {'enable': conf['rudp']}, 'recv': {'enable': conf['rudp']}}}}
     try:
         with open(p, 'w') as f:
             json.dump(doc, f, indent=1)
@@ -217,6 +219,7 @@ class Node:
         # new size waits in pending_size and is adopted when the last reader closes.
         self.follow = (conf['size'] == 'follow')
         self.source_size = None       # (w, h) seen on the NDI branch, before scaling
+        self.source_fps = None        # the sender's frame rate, from the same caps
         self.pending_size = None      # (w, h) to adopt once /dev/videoN has no reader
         self.out_frames = 0           # frames written to the device by the current output pipeline
         self._fail_streak = 0         # consecutive failed connects (a stale address is re-resolved through mDNS)
@@ -666,6 +669,9 @@ class Node:
         if ev and ev.type == Gst.EventType.CAPS:
             st = ev.parse_caps().get_structure(0)
             ok_w, w = st.get_int('width'); ok_h, h = st.get_int('height')
+            ok_f, fn, fd = st.get_fraction('framerate')
+            if ok_f and fd:
+                self.source_fps = round(fn / fd, 2)
             if ok_w and ok_h and (w, h) != self.source_size:
                 self.source_size = (w, h)
                 log.info('source frame size %dx%d', w, h)
@@ -877,6 +883,7 @@ class Node:
                        'url': (self.resolved or {}).get('url', '')},
             'receiver': c['receiver_name'], 'width': c['width'], 'height': c['height'],
             'size': c['size'], 'autopick': c['autopick'], 'source_size': list(self.source_size) if self.source_size else None,
+            'source_fps': self.source_fps,
             'pending_size': list(self.pending_size) if self.pending_size else None,
             'settled': self.size_settled(), 'out_frames': self.out_frames,
             'readers': self.device_readers() if self.follow else [],
