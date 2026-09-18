@@ -7,6 +7,11 @@ install_v4l2loopback(){
   fi
   printf 'options v4l2loopback devices=1 video_nr=%s card_label=NDI exclusive_caps=1 max_buffers=2\n' "$dev" > /etc/modprobe.d/hndi.conf
   printf 'v4l2loopback\n' > /etc/modules-load.d/hndi.conf
+  # udev probes the node at creation, before any writer streams, and records it as a video OUTPUT
+  # only (ID_V4L_CAPABILITIES=:video_output:); consumers that read that property (PipeWire, a
+  # browser's camera enumeration) must see a capture device — kxkm-ai2 2026-09-18
+  printf 'SUBSYSTEM=="video4linux", ATTR{name}=="NDI", ENV{ID_V4L_CAPABILITIES}=":capture:", ENV{ID_V4L_PRODUCT}="NDI"\n' > /etc/udev/rules.d/71-hndi-loopback.rules
+  udevadm control --reload 2>/dev/null || true
   if ! modinfo v4l2loopback >/dev/null 2>&1; then
     bad "module not built (dkms status: $(dkms status 2>/dev/null | tr '\n' ' ')) — kernel headers installed?"; return 1
   fi
