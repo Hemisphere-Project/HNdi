@@ -40,31 +40,48 @@ VERSION = '0.1.2'
 STATUS_PAGE = """<!DOCTYPE html><html><head><meta charset=utf-8><title>hndi-in</title>
 <meta name=viewport content="width=device-width,initial-scale=1"><style>
 :root{color-scheme:dark}body{margin:0;background:#0c1016;color:#dfe7ef;font:15px/1.5 ui-monospace,Menlo,Consolas,monospace}
-.wrap{max-width:560px;margin:0 auto;padding:24px}h1{font-size:15px;letter-spacing:.12em;text-transform:uppercase;color:#7c8aa0;font-weight:600;margin:0 0 16px}
-.state{font-size:34px;font-weight:700;margin:0 0 4px;letter-spacing:.02em}.sub{color:#7c8aa0;margin:0 0 20px}
-.grid{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;border-top:1px solid #1c2530;padding-top:14px}
-.k{color:#7c8aa0}.v{text-align:right;font-variant-numeric:tabular-nums}
+.wrap{max-width:640px;margin:0 auto;padding:24px}h1{font-size:15px;letter-spacing:.12em;text-transform:uppercase;color:#7c8aa0;font-weight:600;margin:0 0 16px}
+h2{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#7c8aa0;font-weight:600;margin:22px 0 8px;border-top:1px solid #1c2530;padding-top:14px}
+.state{font-size:34px;font-weight:700;margin:0 0 4px;letter-spacing:.02em}.sub{color:#7c8aa0;margin:0 0 6px}
+.grid{display:grid;grid-template-columns:auto 1fr;gap:6px 18px}.k{color:#7c8aa0}.v{text-align:right;font-variant-numeric:tabular-nums}
 .dot{display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:middle;margin-right:8px}
 .running{color:#4ade80}.d-running{background:#4ade80}.stalled{color:#fbbf24}.d-stalled{background:#fbbf24}
 .connecting{color:#60a5fa}.d-connecting{background:#60a5fa}.retrying,.resolving{color:#f87171}.d-retrying,.d-resolving{background:#f87171}
-.stopped{color:#7c8aa0}.d-stopped{background:#7c8aa0}.warn{color:#fbbf24}</style></head>
+.stopped{color:#7c8aa0}.d-stopped{background:#7c8aa0}.warn{color:#fbbf24}
+.src{display:block;width:100%;text-align:left;background:#131a24;color:#dfe7ef;border:1px solid #1c2530;border-radius:8px;padding:10px 12px;margin:6px 0;font:inherit;cursor:pointer}
+.src:hover{border-color:#60a5fa}.src.on{border-color:#4ade80;background:#0f2418}.src small{color:#7c8aa0;float:right}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}.btn{background:#131a24;color:#dfe7ef;border:1px solid #1c2530;border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer}
+.btn.on{border-color:#4ade80;color:#4ade80}.btn.off{border-color:#f87171;color:#f87171}.hint{color:#7c8aa0;font-size:13px}</style></head>
 <body><div class=wrap><h1>HNdi input node</h1>
 <div id=state class=state>…</div><div id=sub class=sub></div>
-<div class=grid id=grid></div></div><script>
-const $=id=>document.getElementById(id);
+<h2>Sources</h2><div id=sources class=hint>searching…</div>
+<div class=row><button class="btn off" id=nosrc onclick="setSource('')">no source (black / slate)</button></div>
+<div class=hint>Click a source to put it on the device. The choice is not persisted: after a restart the node waits for a pick.</div>
+<h2>Bandwidth</h2><div class=row id=bw></div>
+<h2>Status</h2><div class=grid id=grid></div></div><script>
+const $=id=>document.getElementById(id);let cur='',want='';
+async function setSource(name){want=name;if(name){await fetch('/source',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,persist:false})});}
+ else{await fetch('/source',{method:'DELETE'});}tick();}
+async function setBw(mode){await fetch('/bandwidth',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode})});tick();}
+async function sources(){try{const l=await(await fetch('/sources',{cache:'no-store'})).json();
+ if(!l.length){$('sources').innerHTML='<span class=hint>no NDI source on the network</span>';return;}
+ $('sources').innerHTML=l.map(s=>'<button class="src'+(s.name===cur?' on':'')+'" onclick="setSource('+JSON.stringify(s.name).replace(/"/g,'&quot;')+')">'+s.name.replace(/</g,'&lt;')+'<small>'+(s.url||'')+'</small></button>').join('');
+}catch(e){$('sources').innerHTML='<span class=hint>(bridge unreachable)</span>';}}
 async function tick(){try{
  const s=await(await fetch('/status',{cache:'no-store'})).json();
- const st=s.stalled&&s.state==='running'?'stalled':s.state;
+ const st=s.stalled&&s.state==='running'?'stalled':s.state;cur=s.source.override||s.source.configured||'';
  $('state').className='state '+st;$('state').innerHTML='<span class="dot d-'+st+'"></span>'+st.toUpperCase();
- $('sub').textContent=(s.source.resolved||'—')+'   ·   as '+s.receiver;
- const rows=[['source (config)',s.source.configured||'first found'],['override',s.source.override||'—'],
-  ['device',s.device+'  '+s.format+'  '+s.width+'×'+s.height],['fps',s.fps_measured+(s.fps?(' / '+s.fps):'')],
+ $('sub').textContent=(s.source.resolved||(cur?cur+' (looking for it)':(s.autopick===false?'no source — pick one below':'first source found')))+'   ·   as '+s.receiver;
+ $('nosrc').className='btn '+(cur?'off':'on');
+ $('bw').innerHTML=['highest','lowest','auto'].map(m=>'<button class="btn'+(s.mode===m?' on':'')+'" onclick="setBw(\\''+m+'\\')">'+m+'</button>').join('');
+ const rows=[['device',s.device+'  '+s.format+'  '+s.width+'×'+s.height+(s.size==='follow'?' · follows the source':'')],['fps',s.fps_measured+(s.fps?(' / '+s.fps):'')],
   ['frames',s.frames],['restarts',s.restarts],['last frame',(s.last_frame_age_ms==null?'—':s.last_frame_age_ms+' ms ago')],
-  ['bandwidth',s.bandwidth+(s.auto?' · auto':'')+' · '+s.profile],['thresholds','stall '+s.thresholds.stall_ms+' · dead '+s.thresholds.dead_ms+' · hold '+s.thresholds.hold_ms+' ms'],
+  ['bandwidth',s.bandwidth+(s.auto?' · auto':'')+' · '+s.profile],['readers',(s.readers||[]).length?s.readers.join(', '):'none'],
   ['uptime',s.uptime_s+' s'],['version',s.version]];
  $('grid').innerHTML=rows.map(r=>'<div class=k>'+r[0]+'</div><div class="v'+(r[0]==='restarts'&&s.restarts>0?' warn':'')+'">'+r[1]+'</div>').join('');
+ document.querySelectorAll('.src').forEach(b=>b.classList.toggle('on',b.textContent.replace(/\\s*\\S+:\\d+$/,'')===cur));
 }catch(e){$('state').textContent='(bridge unreachable)';$('state').className='state stopped';}}
-tick();setInterval(tick,1000);</script></body></html>"""
+tick();sources();setInterval(tick,1000);setInterval(sources,3000);</script></body></html>"""
 
 CONF_PATHS = ['/boot/firmware/hndi.conf', '/boot/hndi.conf']
 STATE_DIRS = ['/data/var/hndi', '/var/tmp/hndi']
@@ -859,7 +876,7 @@ class Node:
                        'resolved': self.resolved['name'] if self.resolved else '',
                        'url': (self.resolved or {}).get('url', '')},
             'receiver': c['receiver_name'], 'width': c['width'], 'height': c['height'],
-            'size': c['size'], 'source_size': list(self.source_size) if self.source_size else None,
+            'size': c['size'], 'autopick': c['autopick'], 'source_size': list(self.source_size) if self.source_size else None,
             'pending_size': list(self.pending_size) if self.pending_size else None,
             'settled': self.size_settled(), 'out_frames': self.out_frames,
             'readers': self.device_readers() if self.follow else [],
